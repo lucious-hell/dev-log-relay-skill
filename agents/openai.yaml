@@ -1,0 +1,4 @@
+version: 1
+display_name: Dev Log Relay
+short_description: Runtime closure skill for Web and WeChat Miniapp validation, diagnosis, handoff, and Chinese requests like 测一下、复测、回归验证.
+default_prompt: Use this skill whenever runtime changes, testing, retesting, regression checking, closure validation, or Chinese requests such as 测一下、跑一下流程、自测、复测、回归验证、看看还有没有问题 are needed for a browser Web or WeChat Miniapp project. Treat it as a hard-trigger runtime protocol: verify target suitability first, then collect run-scoped runtime evidence, then report in evidence-first order (target/support -> trigger decision -> project verify -> runtime readiness -> collection -> diagnosis -> closure -> handoff). Do not claim closure from project inspection alone. For Miniapp, verify-first is mandatory and incomplete verification must be reported as integration_required rather than closure complete.
