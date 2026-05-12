@@ -11,9 +11,15 @@ It does not try to be a universal agent for every stack. Its job is narrower and
 - Skill-first: natural-language trigger rules live in `SKILL.md`
 - Runtime-first: project inspection is not treated as runtime proof
 - Evidence-first: runtime work should end with a structured report, not a vague summary
+- Four-layer evidence ladder: `project_structure -> instrumentation_attached -> runtime_events_observed -> user_flow_closed`
+- Scenario-first validation: validate user flows and state transitions, not just raw log presence
+- Regression baselines: compare scenario, request, state, and signal changes across runs
 - Web closed loop: strong support for browser Web flows
-- Miniapp verify-first: strong integration verification and half-automatic diagnostic loop
+- Miniapp executable closure: verify-first for readiness, then `run -> scenario -> closure` for run-scoped closure evidence
 - Driver-agnostic: Playwright is a reference driver, but external IDE/browser agents can drive the target too
+- Project resolution: monorepo, Next app/pages router, Miniapp `miniprogramRoot`, subpackages, and source/upload layout are inspected through one resolution report
+- Release decision: runtime closure now collapses into `ship | hold | manual_review_required`
+- CI-friendly: readiness, scenario-smoke, closure, and report modes return stable JSON and exit codes
 
 ## Repository Layout
 
@@ -92,6 +98,15 @@ The default evidence-first report order is:
 7. `closure`
 8. `handoff`
 
+The runtime evidence itself is now separated into four layers:
+
+1. `project_structure`
+2. `instrumentation_attached`
+3. `runtime_events_observed`
+4. `user_flow_closed`
+
+That separation is intentional. “能接入” and “流程已闭环” are not the same thing.
+
 ## Main Entrypoints
 
 The skill prefers the wrapper scripts in `scripts/` so the user or agent does not need to remember internal runtime details.
@@ -100,6 +115,9 @@ The skill prefers the wrapper scripts in `scripts/` so the user or agent does no
 - `scripts/doctor.sh`
 - `scripts/project-verify.sh`
 - `scripts/miniapp-verify.sh`
+- `scripts/miniapp-run.sh`
+- `scripts/miniapp-scenario.sh`
+- `scripts/miniapp-closure.sh`
 - `scripts/agent-contract.sh`
 - `scripts/web-autoloop.sh`
 - `scripts/handoff.sh`
@@ -113,8 +131,64 @@ The project keeps a strict distinction between project inspection and runtime pr
 - `project verify`: "Is the project structurally ready to be instrumented?"
 - `web verify` without `runId`: "What can we infer from project inspection only?"
 - `web verify --runId <runId>` or `/ai/run/:runId/readiness`: "What runtime signals were actually observed?"
+- `miniapp verify`: "Is the Miniapp structure and attachment ready for runtime closure?"
+- `miniapp run/scenario/closure`: "Did a real Miniapp action chain produce closure-grade evidence and a release decision?"
 
 That boundary is deliberate. Project structure helps preparation; it does not prove runtime closure.
+
+It also keeps a strict distinction between:
+
+- target detection
+- project compatibility
+- runtime observation
+- scenario closure
+
+If the skill only reaches the first or second layer, it must not claim that the user flow is closed.
+
+## Validation Model
+
+The runtime engine is no longer only run-centered. It is also:
+
+- `scenario-centered`: declare expected user flow and state transitions
+- `baseline-aware`: compare current run with known-good signals
+- `failure-chain-oriented`: link UI breakage back to request, route, lifecycle, render, or data-consumption stages
+
+Typical validation additions now include:
+
+- `request_to_ui_continuity`
+- `cache_then_revalidate`
+- `stale_fallback_on_error`
+- `loading_empty_error_exclusive`
+- `miniapp_request_to_setData_continuity`
+
+These templates are exposed through the runtime CLI and APIs rather than a dashboard.
+
+The built-in Web example now runs this chain end to end: it emits route, network, and render evidence, validates a scenario, captures a baseline snapshot, and compares later runs back to that baseline before closure is claimed.
+
+Miniapp verification also handles more realistic project layouts than a fixed template path. It can now read `project.config.json`, honor `miniprogramRoot`, and follow subpackage page declarations so verify-first is closer to real projects.
+
+Miniapp closure is now a dedicated chain instead of a verify-only placeholder:
+
+- `relay miniapp verify`
+- `relay miniapp run`
+- `relay miniapp scenario`
+- `relay miniapp closure`
+
+That chain uses Miniapp-specific evidence such as action boundaries, route stack continuity, lifecycle continuity, request attribution, and `setData` / state signatures. `miniapp verify` alone is not a closure result.
+
+Project-local scenarios can also be loaded from:
+
+```text
+tooling/scenarios/*.json
+```
+
+Project-local baseline snapshots can also be loaded from:
+
+```text
+tooling/baselines/*.json
+```
+
+That means a target project can gradually accumulate its own reusable flow assets instead of relying only on built-in templates.
 
 ## Quick Start
 
@@ -142,6 +216,16 @@ Examples:
 ./scripts/project-verify.sh --target web --pretty
 ./scripts/web-autoloop.sh --target web --pretty
 ./scripts/miniapp-verify.sh --pretty
+./scripts/miniapp-run.sh --templateName miniapp_home_entry --pretty
+./scripts/miniapp-scenario.sh --runId <runId> --templateName miniapp_home_entry --pretty
+./scripts/miniapp-closure.sh --runId <runId> --pretty
+cd runtime && npm run cli -- scenario list --pretty
+cd runtime && npm run cli -- scenario inspect --templateName miniapp_home_entry --pretty
+cd runtime && npm run cli -- project scenarios --pretty
+cd runtime && npm run cli -- project baselines --pretty
+cd runtime && npm run cli -- ai release-decision --runId <runId> --pretty
+cd runtime && npm run cli -- ci closure --runId <runId> --pretty
+cd runtime && npm run cli -- ci regression --runId <runId> --baselineRunId <baselineRunId> --pretty
 ```
 
 ### 3. Read the runtime docs
@@ -154,7 +238,7 @@ For APIs, CLI commands, adapters, artifacts, and examples, see [runtime/README.m
 - Treat Web and Miniapp as separate supported surfaces with different closure rules
 - Do not claim closure from project-only evidence
 - Do not enter structural repair before `collection` / `integrity` is acceptable
-- For Miniapp, verify-first is mandatory
+- For Miniapp, verify-first is mandatory, but closure requires `miniapp run -> miniapp scenario -> miniapp closure`
 
 ## Open Source License
 
@@ -238,6 +322,16 @@ dev-log-relay-skill/
 7. 拉取 closure
 8. 如无法闭环，则产出 handoff
 
+如果目标是微信小程序，默认闭环顺序应明确为：
+
+1. `miniapp verify`
+2. `miniapp run`
+3. `miniapp scenario`
+4. `miniapp closure`
+5. 必要时 `handoff`
+
+这里只把 `miniapp verify` 视为“接入与准备度检查”，不视为“流程已闭环”。
+
 默认证据汇报顺序：
 
 1. `target / support`
@@ -257,6 +351,9 @@ dev-log-relay-skill/
 - `scripts/doctor.sh`
 - `scripts/project-verify.sh`
 - `scripts/miniapp-verify.sh`
+- `scripts/miniapp-run.sh`
+- `scripts/miniapp-scenario.sh`
+- `scripts/miniapp-closure.sh`
 - `scripts/agent-contract.sh`
 - `scripts/web-autoloop.sh`
 - `scripts/handoff.sh`
@@ -270,6 +367,8 @@ dev-log-relay-skill/
 - `project verify`：回答“项目结构上是否已经具备注入条件”
 - 不带 `runId` 的 `web verify`：回答“仅从结构检查能看出什么”
 - `web verify --runId <runId>` 或 `/ai/run/:runId/readiness`：回答“这轮真实运行到底收到了哪些信号”
+- `miniapp verify`：回答“小程序结构和接入是否具备运行闭环前提”
+- `miniapp run/scenario/closure`：回答“是否真的执行了动作链、拿到了闭环证据、可以给出 release decision”
 
 这是有意设计的边界收敛：结构准备度不等于运行闭环完成。
 
@@ -299,6 +398,9 @@ http://127.0.0.1:5077
 ./scripts/project-verify.sh --target web --pretty
 ./scripts/web-autoloop.sh --target web --pretty
 ./scripts/miniapp-verify.sh --pretty
+./scripts/miniapp-run.sh --templateName miniapp_home_entry --pretty
+./scripts/miniapp-scenario.sh --runId <runId> --templateName miniapp_home_entry --pretty
+./scripts/miniapp-closure.sh --runId <runId> --pretty
 ```
 
 #### 3. 查看 runtime 说明
@@ -311,7 +413,7 @@ API、CLI、适配器、artifact 和示例请看 [runtime/README.md](./runtime/R
 - 明确区分 Web 与 Miniapp，不混淆闭环标准
 - 没有真实 run 证据时，不宣称已验证完成
 - `collection / integrity` 不足时，先修接入，不直接修业务
-- Miniapp 默认必须 `verify-first`
+- Miniapp 默认必须 `verify-first`，但真正闭环必须走 `miniapp run -> miniapp scenario -> miniapp closure`
 
 ### 开源协议
 

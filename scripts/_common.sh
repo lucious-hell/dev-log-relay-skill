@@ -3,9 +3,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="$ROOT/runtime"
+WORKSPACE_ROOT="${DEV_LOG_RELAY_WORKSPACE_ROOT:-$PWD}"
 RELAY_URL="${RELAY_URL:-http://127.0.0.1:5077}"
 RELAY_PID_FILE="${RELAY_PID_FILE:-$ROOT/.relay.pid}"
 RELAY_LOG_FILE="${RELAY_LOG_FILE:-$ROOT/.relay.log}"
+
+export DEV_LOG_RELAY_WORKSPACE_ROOT="$WORKSPACE_ROOT"
 
 ensure_runtime_ready() {
   cd "$RUNTIME_DIR"

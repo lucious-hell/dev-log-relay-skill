@@ -44,22 +44,31 @@ It should be considered active for both English and Chinese task phrasing. Typic
    - `collection`
    - `diagnosis`
    - `miniapp-signals`
+   - `scenario` / `state-report`
    - `closure`
+   - `release-decision`
 8. If unresolved or incomplete, emit `handoff`.
 
 ## Evidence Order
 
 Always read evidence in this order:
 
-1. `collection`
-2. `integrity` / `readiness`
+1. evidence layer
+   - `project_structure`
+   - `instrumentation_attached`
+   - `runtime_events_observed`
+   - `user_flow_closed`
+2. `collection`
+3. `integrity` / `readiness`
    - project-only readiness is not enough for closure
    - prefer run-scoped readiness from a real `runId`
-3. `timeline`
-4. `diagnosis`
-5. `repair-brief`
-6. `closure`
-7. `handoff` if needed
+4. `scenario` / `state-report` / `baseline`
+   - if project-local assets exist, inspect `project scenarios` / `project baselines` first
+5. `timeline`
+6. `diagnosis`
+7. `repair-brief`
+8. `closure`
+9. `handoff` if needed
 
 ## Default Report Template
 
@@ -76,11 +85,19 @@ For runtime validation tasks, the default final report should be structured befo
 
 Natural-language explanation is secondary. Do not replace the evidence block with a prose-only summary.
 
+## Scenario Preference
+
+If a scenario template or explicit `ScenarioSpec` is available, prefer it over ad hoc log reading.
+
+- Web: scenario validation is the preferred proof of `user_flow_closed`
+- Miniapp: scenario validation is observation-first and should be treated as stronger than raw signal presence, but weaker than a fully driven web loop
+
 ## Stop Conditions
 
 - `closure.decision.status === resolved`
 - `collection.status === incomplete`
 - integrity/readiness too low
 - regressions appear
+- blocking baseline diff or release decision says `hold`
 - repeated no-progress loop
 - maximum attempts reached

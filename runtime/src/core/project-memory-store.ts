@@ -76,6 +76,10 @@ export class ProjectMemoryStore {
       knownSignalGaps,
       resolvedFingerprints: Array.from(new Set(records.flatMap((item) => item.resolvedFingerprints))).slice(0, 50),
       regressedFingerprints: Array.from(new Set(records.flatMap((item) => item.regressedFingerprints))).slice(0, 50),
+      recentScenarioResults: Array.from(
+        new Set(records.flatMap((item) => [...(item.blockingScenarioPasses || []), ...(item.blockingScenarioFailures || [])]))
+      ).slice(0, 20),
+      recentFailureStages: Array.from(new Set(records.map((item) => item.failureStage).filter(Boolean))).slice(0, 20) as ProjectKnowledgeSnapshot["recentFailureStages"],
     };
   }
 

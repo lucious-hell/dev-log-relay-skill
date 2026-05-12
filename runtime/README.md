@@ -1,13 +1,14 @@
-# Dev Log Relay Runtime v4
+# Dev Log Relay Runtime v5
 
 这是 Dev Log Relay skill 的 runtime 实现层，负责 HTTP 服务、CLI、适配器、artifact、diagnosis、closure 与 handoff。
 
-它提供两层入口：
+它提供三层验证入口：
 
 - HTTP 服务：负责 `run / step / timeline / diagnosis / closure / artifact`
 - Node CLI：负责把闭环动作串起来，减少 AI 自己拼接调用
 - Project Verify：负责真实项目入口检查、接入准备度评估和项目记忆
 - Autoloop：负责 `collection -> diagnosis -> repair -> retest -> decision -> handoff`
+- Scenario / Baseline：负责场景级验证、状态转移验证与回归基线对比
 
 ## 适用范围
 
@@ -36,14 +37,16 @@
 1. `POST /orchestrations/start` 创建一轮带策略的测试 run
 2. `POST /runs/:runId/steps/start` / `.../end` 标记步骤
 3. SDK 自动上报日志、网络、路由、生命周期
-4. `GET /ai/run/:runId/collection` 先确认采证闭环是否完整
-5. `GET /ai/run/:runId/diagnosis` 获取诊断摘要
-6. `GET /ai/run/:runId/repair-brief` 生成机器优先修复简报
-7. `GET /ai/run/:runId/closure` 获取闭环判断
-8. `GET /ai/run/:runId/report` 获取证据优先的统一闭环报告
-9. `GET /ai/run/:runId/artifact` 生成 JSON 工件
-10. `GET /ai/diff?baselineRunId=...&currentRunId=...` 对比修复前后
-11. `GET /ai/autoloop/:id/decision` 执行 stop gate 决策
+4. `GET /ai/targets/detect` / `GET /ai/project/compatibility` 先确认目标和工程结构
+5. `GET /ai/run/:runId/collection` 先确认采证闭环是否完整
+6. `POST /scenarios/validate` 进行场景级验证
+7. `GET /ai/run/:runId/diagnosis` 获取诊断摘要
+8. `GET /ai/run/:runId/repair-brief` 生成机器优先修复简报
+9. `GET /ai/run/:runId/closure` 获取闭环判断
+10. `GET /ai/run/:runId/report` 获取证据优先的统一闭环报告
+11. `GET /ai/run/:runId/artifact` 生成 JSON 工件
+12. `GET /ai/diff/scenario` / `GET /ai/diff/state` 做回归基线对比
+13. `GET /ai/autoloop/:id/decision` 执行 stop gate 决策
 
 ## 启动
 
@@ -66,7 +69,16 @@ npm run cli -- loop compare --baselineRunId <a> --currentRunId <b> --pretty
 npm run cli -- autoloop run --target web --pretty
 npm run cli -- web verify --pretty
 npm run cli -- miniapp verify --pretty
+npm run cli -- miniapp run --template miniapp_home_entry --driver devtools-automator --pretty
 npm run cli -- project verify --target auto --pretty
+npm run cli -- project scenarios --target miniapp --pretty
+npm run cli -- project baselines --target miniapp --pretty
+npm run cli -- scenario list --target miniapp --pretty
+npm run cli -- scenario inspect --templateName miniapp_home_entry --target miniapp --pretty
+npm run cli -- doctor detect --target auto --pretty
+npm run cli -- scenario validate --runId <runId> --templateName request_to_ui_continuity --pretty
+npm run cli -- baseline compare --baselineRunId <a> --currentRunId <b> --pretty
+npm run cli -- ci regression --runId <runId> --baselineRunId <baselineRunId> --pretty
 npm run cli -- doctor readiness --target auto --pretty
 npm run cli -- doctor enforcement --target web --phase self_test --runtimeImpact true --runId <runId> --closureClaim true --pretty
 npm run cli -- agent contract --target web --driver computer-use --pretty
@@ -76,16 +88,21 @@ npm run cli -- ai handoff --runId <runId> --pretty
 支持命令：
 
 - `relay doctor target`
+- `relay doctor detect`
 - `relay doctor trigger`
 - `relay doctor enforcement`
 - `relay doctor readiness`
 - `relay project identify`
+- `relay project compatibility`
 - `relay project verify`
 - `relay project advise`
 - `relay project memory`
 - `relay project history`
+- `relay project scenarios`
+- `relay project baselines`
 - `relay agent contract`
 - `relay web verify`
+- `relay miniapp run`
 - `relay run start`
 - `relay run step start`
 - `relay run step end`
@@ -93,8 +110,25 @@ npm run cli -- ai handoff --runId <runId> --pretty
 - `relay ai timeline`
 - `relay ai diagnosis`
 - `relay ai report`
+- `relay ai summary`
+- `relay ai failure-report`
+- `relay ai pr-comment`
 - `relay ai closure`
 - `relay ai diff`
+- `relay ci readiness`
+- `relay ci scenario-smoke`
+- `relay ci closure`
+- `relay ci report`
+- `relay ci regression`
+- `relay scenario list`
+- `relay scenario inspect`
+- `relay scenario validate`
+- `relay scenario baseline`
+- `relay scenario diff`
+- `relay baseline capture`
+- `relay baseline compare`
+- `relay template list`
+- `relay template validate`
 - `relay loop web`
 - `relay loop compare`
 - `relay autoloop start`
@@ -123,6 +157,19 @@ npm run cli -- ai handoff --runId <runId> --pretty
 | Backend | inapplicable | 无 | 仅辅助 relay 信号源 | 作为 web/miniapp 附属信号 |
 | Other | unsupported | 无 | 超出技术栈边界 | 不建议使用本 skill |
 
+## 四层证据链
+
+运行时能力统一分为四层：
+
+1. `project_structure`
+2. `instrumentation_attached`
+3. `runtime_events_observed`
+4. `user_flow_closed`
+
+只有走到第 4 层，才允许把某个用户流程当作“真的闭环”。
+
+Miniapp 的 project verify 也会优先解析真实工程信号，而不只是假设目录模板固定。它会结合 `project.config.json`、`miniprogramRoot`、主包/分包页面声明、wrapper/patch 痕迹和页面文件解析结果，尽量输出 `partial` 或 `unknown_but_observable`，而不是轻易把真实项目打成 `unsupported`。
+
 ## 服务接口
 
 ### 编排
@@ -141,6 +188,7 @@ npm run cli -- ai handoff --runId <runId> --pretty
 ### AI 查询
 
 - `GET /ai/targets/support?target=...`
+- `GET /ai/targets/detect?target=...`
 - `GET /ai/driver/contract?target=...&driver=...`
 - `POST /ai/trigger/decision`
 - `POST /ai/task/enforcement`
@@ -148,6 +196,7 @@ npm run cli -- ai handoff --runId <runId> --pretty
 - `GET /ai/project/profile`
 - `GET /ai/project/memory`
 - `GET /ai/project/history`
+- `GET /ai/project/compatibility`
 - `GET /ai/runs`
 - `GET /ai/web/project-check`
 - `GET /ai/miniapp/project-check`
@@ -156,12 +205,16 @@ npm run cli -- ai handoff --runId <runId> --pretty
 - `GET /ai/run/:runId/incidents`
 - `GET /ai/run/:runId/context`
 - `GET /ai/run/:runId/flow`
+- `GET /ai/run/:runId/scenario`
+- `GET /ai/run/:runId/state-report`
+- `GET /ai/run/:runId/baseline`
 - `GET /ai/run/:runId/diagnosis`
 - `GET /ai/run/:runId/closure`
 - `GET /ai/run/:runId/report`
 - `GET /ai/run/:runId/integrity`
 - `GET /ai/run/:runId/readiness`
 - `GET /ai/run/:runId/failure-chain`
+- `GET /ai/run/:runId/root-cause-map`
 - `GET /ai/run/:runId/repair-strategy`
 - `GET /ai/run/:runId/handoff`
 - `GET /ai/run/:runId/miniapp-signals`
@@ -169,11 +222,18 @@ npm run cli -- ai handoff --runId <runId> --pretty
 - `GET /ai/run/:runId/hotspots`
 - `GET /ai/run/:runId/repair-brief`
 - `GET /ai/run/:runId/artifact`
+- `GET /ai/run/:runId/summary-view`
+- `GET /ai/run/:runId/failure-report`
+- `GET /ai/run/:runId/pr-comment`
 - `GET /ai/web/integration-guide`
 - `GET /ai/miniapp/integration-guide`
 - `GET /ai/autoloop/:id`
 - `GET /ai/autoloop/:id/decision`
 - `GET /ai/diff?baselineRunId=...&currentRunId=...`
+- `GET /ai/diff/scenario?baselineRunId=...&currentRunId=...`
+- `GET /ai/diff/state?baselineRunId=...&currentRunId=...`
+- `GET /ai/templates`
+- `POST /scenarios/validate`
 
 ### 兼容接口
 
@@ -414,6 +474,16 @@ Playwright 在本仓库里的角色是：
 它的作用是证明这条闭环链能稳定跑通，不是要求所有 AI agent 都必须用它。
 
 - `runtime/examples/web-playwright/runner.mjs`
+
+这个示例现在会在单次 run 内自动补齐：
+
+- route / network / render 证据
+- `request_to_ui_continuity` 场景验证
+- baseline 快照生成
+- 与 baseline 的 scenario / state diff
+- 最终 `report` 拉取
+
+所以它不只是“打日志”，而是完整演示四层证据链如何收口到 closure 结论。
 
 手动运行：
 

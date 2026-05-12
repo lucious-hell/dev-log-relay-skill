@@ -1,15 +1,27 @@
 import path from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
-import { readFile } from "node:fs/promises";
 import { createMiniappRelay } from "./adapters/miniapp.js";
+import { MiniappExecutionCoordinator } from "./core/miniapp-execution-coordinator.js";
 
 interface CliOptions {
   relay: string;
   pretty: boolean;
   artifact?: string;
   params: Record<string, string>;
+}
+
+function resolveWorkspaceRoot(): string {
+  return path.resolve(process.env.DEV_LOG_RELAY_WORKSPACE_ROOT || process.cwd());
+}
+
+function withWorkspaceHeader(init: RequestInit = {}): RequestInit {
+  const headers = new Headers(init.headers || {});
+  headers.set("x-dev-log-relay-workspace-root", resolveWorkspaceRoot());
+  return {
+    ...init,
+    headers,
+  };
 }
 
 interface CliDeps {
@@ -76,7 +88,7 @@ function parseArgs(argv: string[]): { command: string[]; options: CliOptions } {
 }
 
 async function requestJson(fetchImpl: typeof fetch, url: string, init?: RequestInit) {
-  const response = await fetchImpl(url, init);
+  const response = await fetchImpl(url, withWorkspaceHeader(init));
   const text = await response.text();
   const json = text ? JSON.parse(text) : {};
   if (!response.ok) {
@@ -97,7 +109,7 @@ async function maybeWriteArtifact(filePath: string | undefined, payload: unknown
   if (!filePath) {
     return "";
   }
-  const absolute = path.isAbsolute(filePath) ? filePath : path.join(process.cwd(), filePath);
+  const absolute = path.isAbsolute(filePath) ? filePath : path.join(resolveWorkspaceRoot(), filePath);
   await mkdir(path.dirname(absolute), { recursive: true });
   await writeFile(absolute, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
   return absolute;
@@ -107,51 +119,9 @@ function format(payload: unknown, pretty: boolean): string {
   return `${JSON.stringify(payload, null, pretty ? 2 : 0)}\n`;
 }
 
-async function pathExists(filePath: string): Promise<boolean> {
-  try {
-    await access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function detectLocalTarget(): Promise<string> {
-  const cwd = process.cwd();
-  const hasMiniappAppJson = await pathExists(path.join(cwd, "app.json"));
-  const hasMiniappProject = await pathExists(path.join(cwd, "project.config.json"));
-  if (hasMiniappAppJson || hasMiniappProject) {
-    return "miniapp";
-  }
-  const hasPackageJson = await pathExists(path.join(cwd, "package.json"));
-  if (!hasPackageJson) {
-    return "unknown";
-  }
-  try {
-    const pkg = JSON.parse(await readFile(path.join(cwd, "package.json"), "utf8")) as Record<string, any>;
-    const deps = {
-      ...(pkg.dependencies || {}),
-      ...(pkg.devDependencies || {}),
-    };
-    const frameworkDeps = ["react", "vue", "next", "vite", "@tarojs/taro", "@dcloudio/uni-app"];
-    const hasFrameworkDep = frameworkDeps.some((name) => name in deps);
-    const likelyWebEntrypoints = await Promise.all([
-      pathExists(path.join(cwd, "src/main.ts")),
-      pathExists(path.join(cwd, "src/main.tsx")),
-      pathExists(path.join(cwd, "src/main.js")),
-      pathExists(path.join(cwd, "src/main.jsx")),
-      pathExists(path.join(cwd, "src/index.tsx")),
-      pathExists(path.join(cwd, "pages/_app.tsx")),
-      pathExists(path.join(cwd, "app/layout.tsx")),
-      pathExists(path.join(cwd, "vite.config.ts")),
-      pathExists(path.join(cwd, "vite.config.js")),
-      pathExists(path.join(cwd, "next.config.js")),
-      pathExists(path.join(cwd, "next.config.mjs")),
-    ]);
-    return hasFrameworkDep || likelyWebEntrypoints.some(Boolean) ? "web" : "unknown";
-  } catch {
-    return "unknown";
-  }
+async function fetchDetectedTarget(fetchImpl: typeof fetch, relay: string, target?: string): Promise<string> {
+  const payload = await requestJson(fetchImpl, `${relay}/ai/targets/detect?target=${encodeURIComponent(target || "auto")}`);
+  return payload.detection?.supportedTarget || payload.detection?.detectedTarget || "unknown";
 }
 
 function isStructuredFailure(payload: unknown): payload is CliStandardFailure {
@@ -166,14 +136,49 @@ async function runExampleProcess(spawnImpl: typeof spawn, args: string[]): Promi
   await new Promise<void>((resolve, reject) => {
     const child = spawnImpl(process.execPath, args, {
       cwd: process.cwd(),
-      stdio: "inherit",
+      stdio: ["ignore", "pipe", "pipe"],
     });
+    let stderr = "";
+    if ("stderr" in child && child.stderr && typeof child.stderr.on === "function") {
+      child.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+    }
     child.on("exit", (code) => {
       if (code === 0) {
         resolve();
         return;
       }
-      reject(new Error(`example process exited with code ${code}`));
+      reject(new Error(stderr.trim() || `example process exited with code ${code}`));
+    });
+    child.on("error", reject);
+  });
+}
+
+async function runExampleProcessWithOutput(spawnImpl: typeof spawn, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawnImpl(process.execPath, args, {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    if ("stdout" in child && child.stdout && typeof child.stdout.on === "function") {
+      child.stdout.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+    }
+    if ("stderr" in child && child.stderr && typeof child.stderr.on === "function") {
+      child.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+    }
+    child.on("exit", (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+        return;
+      }
+      reject(new Error(stderr.trim() || `example process exited with code ${code}`));
     });
     child.on("error", reject);
   });
@@ -191,23 +196,44 @@ async function runWebScenario(
   spawnImpl: typeof spawn,
   relay: string,
   runId: string,
-  mode: "baseline" | "broken" | "fixed"
+  mode: "baseline" | "broken" | "fixed",
+  baselineRunId?: string
 ) {
   const runnerPath = path.join(process.cwd(), "examples", "web-playwright", "runner.mjs");
-  await runExampleProcess(spawnImpl, [runnerPath, "--relay", relay, "--runId", runId, "--mode", mode]);
-  const [summary, collection, diagnosis, closure, integrity] = await Promise.all([
+  const runnerArgs = [runnerPath, "--relay", relay, "--runId", runId, "--mode", mode];
+  if (baselineRunId) {
+    runnerArgs.push("--baselineRunId", baselineRunId);
+  }
+  const exampleOutput = await runExampleProcessWithOutput(spawnImpl, runnerArgs);
+  const exampleEvidence = exampleOutput.stdout.trim() ? JSON.parse(exampleOutput.stdout) : null;
+  const [summary, collection, diagnosis, closure, integrity, scenario, baseline, report] = await Promise.all([
     requestJson(fetchImpl, `${relay}/ai/run/${runId}/summary`),
     requestJson(fetchImpl, `${relay}/ai/run/${runId}/collection`),
     requestJson(fetchImpl, `${relay}/ai/run/${runId}/diagnosis`),
     requestJson(fetchImpl, `${relay}/ai/run/${runId}/closure`),
     requestJson(fetchImpl, `${relay}/ai/run/${runId}/integrity`),
+    requestJson(fetchImpl, `${relay}/ai/run/${runId}/scenario`),
+    requestJson(fetchImpl, `${relay}/ai/run/${runId}/baseline`),
+    requestJson(fetchImpl, `${relay}/ai/run/${runId}/report`),
   ]);
+  const [scenarioDiff, stateDiff] = baselineRunId
+    ? await Promise.all([
+        requestJson(fetchImpl, `${relay}/ai/diff/scenario?baselineRunId=${encodeURIComponent(baselineRunId)}&currentRunId=${encodeURIComponent(runId)}`),
+        requestJson(fetchImpl, `${relay}/ai/diff/state?baselineRunId=${encodeURIComponent(baselineRunId)}&currentRunId=${encodeURIComponent(runId)}`),
+      ])
+    : [null, null];
   return {
     summary: summary.summary,
     collection: collection.collection,
     diagnosis: diagnosis.diagnosis,
     closure: closure.closure,
     integrity: integrity.integrity,
+    scenario: scenario.scenario,
+    baseline: baseline.baseline,
+    report: report.report,
+    scenarioDiff: scenarioDiff?.changed || [],
+    stateDiff: stateDiff?.changed || [],
+    exampleEvidence,
   };
 }
 
@@ -223,7 +249,122 @@ async function createRunForScenario(
     target: "web",
     scenario,
     baselineRunId: baselineRunId || "",
+    metadata: {
+      projectRoot: resolveWorkspaceRoot(),
+    },
   });
+}
+
+async function createMiniappRun(
+  fetchImpl: typeof fetch,
+  relay: string,
+  label: string,
+  driver: string,
+  scenarioId: string
+) {
+  return postJson(fetchImpl, `${relay}/runs/start`, {
+    label,
+    target: "miniapp",
+    metadata: {
+      projectRoot: resolveWorkspaceRoot(),
+      driver,
+      scenarioId,
+    },
+  });
+}
+
+function miniappStepKindFromAction(actionType: string): "navigate" | "action" {
+  return actionType === "launch" || actionType === "enter_page" || actionType === "switch_tab" || actionType === "navigate_back" ? "navigate" : "action";
+}
+
+async function runMiniappScenarioExecution(
+  fetchImpl: typeof fetch,
+  relay: string,
+  runId: string,
+  driver: string,
+  scenario: Record<string, any>,
+  projectCheck: Record<string, any>,
+  driverModule?: string
+) {
+  const coordinator = new MiniappExecutionCoordinator();
+  const execution = await coordinator.execute({
+    driver: (driver || "external-agent") as any,
+    scenario: scenario as any,
+    relay,
+    runId,
+    projectRoot: resolveWorkspaceRoot(),
+    driverModule,
+    projectCheck: projectCheck as any,
+  });
+  if (execution.status === "bridge_required") {
+    return execution;
+  }
+  for (const actionResult of execution.actionResults) {
+    const step = await postJson(fetchImpl, `${relay}/runs/${runId}/steps/start`, {
+      name: `${actionResult.type}:${actionResult.pagePath || actionResult.actionId}`,
+      kind: miniappStepKindFromAction(actionResult.type),
+      route: actionResult.pagePath || "",
+      metadata: {
+        actionId: actionResult.actionId,
+        actionType: actionResult.type,
+        pagePath: actionResult.pagePath || "",
+        triggerSource: execution.status === "executed" ? "reference_driver" : "runtime_observed",
+        completionStatus: actionResult.completionStatus || (actionResult.success ? "executed" : "failed"),
+        timeoutMs: actionResult.timeoutMs || 0,
+        retryCount: actionResult.retries || 0,
+      },
+    });
+    if (actionResult.emittedEvents && actionResult.emittedEvents.length > 0) {
+      await postJson(fetchImpl, `${relay}/ingest`, {
+        runId,
+        stepId: step.stepId,
+        records: actionResult.emittedEvents,
+      });
+    }
+    await postJson(fetchImpl, `${relay}/runs/${runId}/steps/${step.stepId}/end`, {
+      status: actionResult.success ? "passed" : "failed",
+      metadata: {
+        actionId: actionResult.actionId,
+        actionType: actionResult.type,
+        pagePath: actionResult.pagePath || "",
+        completionStatus: actionResult.completionStatus || (actionResult.success ? "executed" : "failed"),
+        timeoutMs: actionResult.timeoutMs || 0,
+        retryCount: actionResult.retries || 0,
+      },
+    });
+  }
+  await postJson(fetchImpl, `${relay}/runs/${runId}/end`, {
+    status:
+      execution.status === "driver_not_available"
+        ? "aborted"
+        : execution.actionResults.every((item) => item.success)
+          ? "passed"
+          : "failed",
+  });
+  return execution;
+}
+
+async function fetchMiniappClosureBundle(fetchImpl: typeof fetch, relay: string, runId: string) {
+  const [readiness, collection, diagnosis, closure, releaseDecision, verificationReport, miniappObservation, handoff] = await Promise.all([
+    requestJson(fetchImpl, `${relay}/ai/run/${runId}/readiness`),
+    requestJson(fetchImpl, `${relay}/ai/run/${runId}/collection`),
+    requestJson(fetchImpl, `${relay}/ai/run/${runId}/diagnosis`),
+    requestJson(fetchImpl, `${relay}/ai/run/${runId}/closure`),
+    requestJson(fetchImpl, `${relay}/ai/run/${runId}/release-decision`),
+    requestJson(fetchImpl, `${relay}/ai/run/${runId}/verification-report`),
+    requestJson(fetchImpl, `${relay}/ai/run/${runId}/miniapp-observation`),
+    requestJson(fetchImpl, `${relay}/ai/run/${runId}/handoff`).catch(() => ({ ok: false, handoff: null })),
+  ]);
+  return {
+    readiness: readiness.readiness,
+    collection: collection.collection,
+    diagnosis: diagnosis.diagnosis,
+    closure: closure.closure,
+    releaseDecision: releaseDecision.releaseDecision,
+    verificationReport: verificationReport.verificationReport,
+    miniappObservation: miniappObservation.miniappObservation || miniappObservation.miniappSignals,
+    handoff: handoff.handoff || null,
+  };
 }
 
 async function buildAutoloopArtifact(
@@ -286,6 +427,13 @@ async function identifyProject(fetchImpl: typeof fetch, relay: string, target?: 
   return postJson(fetchImpl, `${relay}/ai/project/identify`, {
     target: target || "",
   });
+}
+
+function exitCodeFromCi(status: string): number {
+  if (status === "pass" || status === "ship") return 0;
+  if (status === "manual_review_required") return 2;
+  if (status === "hold") return 3;
+  return 4;
 }
 
 async function fetchDriverContract(fetchImpl: typeof fetch, relay: string, input: { target: string; driver?: string }) {
@@ -477,7 +625,7 @@ async function projectVerifyPayload(fetchImpl: typeof fetch, relay: string, targ
     recommendedAction:
       projectCheck.report.blockingIssues.length > 0
         ? projectCheck.report.recommendedActions[0] || "Run relay miniapp verify and fix missing coverage."
-        : "Run a real miniapp flow, then query collection/integrity/diagnosis before claiming closure.",
+        : "Run relay miniapp run, then query miniapp scenario and miniapp closure before claiming closure.",
     status: projectCheck.report.status,
   };
 }
@@ -490,15 +638,21 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
   const { command, options } = parseArgs(argv);
 
   try {
+    if (command[0] === "doctor" && command[1] === "detect") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/targets/detect?target=${encodeURIComponent(options.params.target || "auto")}`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
     if (command[0] === "doctor" && command[1] === "target") {
-      const target = options.params.target === "auto" || !options.params.target ? await detectLocalTarget() : options.params.target;
+      const target = options.params.target === "auto" || !options.params.target ? await fetchDetectedTarget(fetchImpl, options.relay, "auto") : options.params.target;
       const payload = await fetchTargetSupport(fetchImpl, options.relay, target);
       stdout(format({ ok: true, detectedTarget: target, ...payload }, options.pretty));
       return 0;
     }
 
     if (command[0] === "doctor" && command[1] === "trigger") {
-      const target = options.params.target === "auto" || !options.params.target ? await detectLocalTarget() : options.params.target;
+      const target = options.params.target === "auto" || !options.params.target ? await fetchDetectedTarget(fetchImpl, options.relay, "auto") : options.params.target;
       const payload = await fetchTriggerDecision(fetchImpl, options.relay, {
         target,
         reason: options.params.reason || "",
@@ -510,7 +664,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     }
 
     if (command[0] === "doctor" && command[1] === "enforcement") {
-      const target = options.params.target === "auto" || !options.params.target ? await detectLocalTarget() : options.params.target;
+      const target = options.params.target === "auto" || !options.params.target ? await fetchDetectedTarget(fetchImpl, options.relay, "auto") : options.params.target;
       const payload = await fetchTaskEnforcement(fetchImpl, options.relay, {
         target,
         phase: options.params.phase || "manual",
@@ -523,7 +677,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     }
 
     if (command[0] === "agent" && command[1] === "contract") {
-      const target = options.params.target === "auto" || !options.params.target ? await detectLocalTarget() : options.params.target;
+      const target = options.params.target === "auto" || !options.params.target ? await fetchDetectedTarget(fetchImpl, options.relay, "auto") : options.params.target;
       const driver = options.params.driver || "computer-use";
       if (target !== "web" && target !== "miniapp" && !options.params.runId) {
         const support = await fetchTargetSupport(fetchImpl, options.relay, target);
@@ -547,7 +701,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     }
 
     if (command[0] === "doctor" && command[1] === "readiness") {
-      const target = options.params.target === "auto" || !options.params.target ? await detectLocalTarget() : options.params.target;
+      const target = options.params.target === "auto" || !options.params.target ? await fetchDetectedTarget(fetchImpl, options.relay, "auto") : options.params.target;
       const support = await fetchTargetSupport(fetchImpl, options.relay, target);
       if (isStructuredFailure(support) || support.report.status === "unsupported" || support.report.status === "inapplicable") {
         const failure = supportFailure(isStructuredFailure(support) ? support : support.report);
@@ -579,6 +733,9 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
             projectVerify: verify,
             closureEligible: verify.closureEligible,
             autoloopEligible: verify.autoloopEligible,
+            driverReady: target === "miniapp" ? verify.projectCheck.blockingIssues?.length === 0 : true,
+            scenarioReady: target === "miniapp" ? verify.projectCheck.blockingIssues?.length === 0 : true,
+            closureReady: verify.closureEligible,
           },
           options.pretty
         )
@@ -587,7 +744,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     }
 
     if (command[0] === "project" && command[1] === "identify") {
-      const target = options.params.target === "auto" || !options.params.target ? await detectLocalTarget() : options.params.target;
+      const target = options.params.target === "auto" || !options.params.target ? await fetchDetectedTarget(fetchImpl, options.relay, "auto") : options.params.target;
       const support = await fetchTargetSupport(fetchImpl, options.relay, target === "unknown" ? "unknown" : target);
       if (isStructuredFailure(support) || support.report.status === "unsupported" || support.report.status === "inapplicable") {
         stdout(format(supportFailure(isStructuredFailure(support) ? support : support.report), options.pretty));
@@ -598,8 +755,29 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       return 0;
     }
 
+    if (command[0] === "project" && command[1] === "compatibility") {
+      const target = options.params.target === "auto" || !options.params.target ? await fetchDetectedTarget(fetchImpl, options.relay, "auto") : options.params.target;
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/project/compatibility?target=${encodeURIComponent(target || "")}`);
+      stdout(format({ ok: true, detectedTarget: target, ...payload }, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "project" && command[1] === "scenarios") {
+      const target = options.params.target || "";
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/project/scenarios${target ? `?target=${encodeURIComponent(target)}` : ""}`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "project" && command[1] === "baselines") {
+      const target = options.params.target || "";
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/project/baselines${target ? `?target=${encodeURIComponent(target)}` : ""}`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
     if (command[0] === "project" && command[1] === "verify") {
-      const target = options.params.target === "auto" || !options.params.target ? await detectLocalTarget() : options.params.target;
+      const target = options.params.target === "auto" || !options.params.target ? await fetchDetectedTarget(fetchImpl, options.relay, "auto") : options.params.target;
       if (target !== "web" && target !== "miniapp") {
         const support = await fetchTargetSupport(fetchImpl, options.relay, target);
         stdout(format(supportFailure(support.report), options.pretty));
@@ -616,7 +794,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     }
 
     if (command[0] === "project" && command[1] === "advise") {
-      const target = options.params.target === "auto" || !options.params.target ? await detectLocalTarget() : options.params.target;
+      const target = options.params.target === "auto" || !options.params.target ? await fetchDetectedTarget(fetchImpl, options.relay, "auto") : options.params.target;
       if (target !== "web" && target !== "miniapp") {
         const support = await fetchTargetSupport(fetchImpl, options.relay, target);
         stdout(format(supportFailure(support.report), options.pretty));
@@ -662,6 +840,19 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       return 0;
     }
 
+    if (command[0] === "project" && command[1] === "knowledge") {
+      const projectId = options.params.projectId || "";
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/project/memory?projectId=${encodeURIComponent(projectId)}`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "project" && command[1] === "baseline") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/baseline`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
     if (command[0] === "web" && command[1] === "verify") {
       const payload = await webVerifyPayload(fetchImpl, options.relay, options.params.runId);
       if (isStructuredFailure(payload)) {
@@ -677,6 +868,9 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       const payload = await postJson(fetchImpl, `${options.relay}/runs/start`, {
         label: options.params.label,
         target: options.params.target,
+        metadata: {
+          projectRoot: resolveWorkspaceRoot(),
+        },
       });
       stdout(format(payload, options.pretty));
       return 0;
@@ -732,8 +926,38 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       return 0;
     }
 
+    if (command[0] === "ai" && command[1] === "verification-report") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/verification-report`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
     if (command[0] === "ai" && command[1] === "report") {
       const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/report`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "ai" && command[1] === "summary") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/summary-view`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "ai" && command[1] === "failure-report") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/failure-report`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "ai" && command[1] === "pr-comment") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/pr-comment`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "ai" && command[1] === "release-decision") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/release-decision`);
       stdout(format(payload, options.pretty));
       return 0;
     }
@@ -761,7 +985,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         mode,
         options.params.baselineRunId
       );
-      const result = await runWebScenario(fetchImpl, spawnImpl, options.relay, orchestration.runId, mode);
+      const result = await runWebScenario(fetchImpl, spawnImpl, options.relay, orchestration.runId, mode, options.params.baselineRunId);
       const artifact = await requestJson(
         fetchImpl,
         `${options.relay}/ai/run/${orchestration.runId}/artifact${options.artifact ? `?path=${encodeURIComponent(options.artifact)}` : ""}`
@@ -797,6 +1021,216 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
       return 0;
     }
 
+    if (command[0] === "template" && command[1] === "list") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/templates${options.params.target ? `?target=${encodeURIComponent(options.params.target)}` : ""}`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "template" && command[1] === "validate") {
+      const payload = await postJson(fetchImpl, `${options.relay}/scenarios/validate`, {
+        runId: options.params.runId,
+        templateName: options.params.name,
+        target: options.params.target || "",
+      });
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "scenario" && command[1] === "validate") {
+      const body = options.params.spec ? JSON.parse(options.params.spec) : undefined;
+      const payload = await postJson(fetchImpl, `${options.relay}/scenarios/validate`, {
+        runId: options.params.runId,
+        templateName: options.params.templateName || "",
+        target: options.params.target || "",
+        spec: body,
+      });
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "scenario" && command[1] === "list") {
+      const target = options.params.target || "";
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/scenarios${target ? `?target=${encodeURIComponent(target)}` : ""}`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "scenario" && command[1] === "inspect") {
+      const templateName = options.params.templateName || options.params.name || "";
+      const target = options.params.target || "";
+      const payload = await requestJson(
+        fetchImpl,
+        `${options.relay}/ai/scenario/inspect?templateName=${encodeURIComponent(templateName)}${target ? `&target=${encodeURIComponent(target)}` : ""}`
+      );
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "scenario" && command[1] === "baseline") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/baseline`);
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "scenario" && command[1] === "diff") {
+      const payload = await requestJson(
+        fetchImpl,
+        `${options.relay}/ai/diff/scenario?baselineRunId=${encodeURIComponent(options.params.baselineRunId)}&currentRunId=${encodeURIComponent(options.params.currentRunId)}`
+      );
+      stdout(format(payload, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "baseline" && command[1] === "capture") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/baseline`);
+      const written = await maybeWriteArtifact(options.artifact, payload);
+      stdout(format({ ...payload, artifactPath: written }, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "baseline" && command[1] === "compare") {
+      const [scenarioDiff, stateDiff, regression] = await Promise.all([
+        requestJson(
+          fetchImpl,
+          `${options.relay}/ai/diff/scenario?baselineRunId=${encodeURIComponent(options.params.baselineRunId)}&currentRunId=${encodeURIComponent(options.params.currentRunId)}`
+        ),
+        requestJson(
+          fetchImpl,
+          `${options.relay}/ai/diff/state?baselineRunId=${encodeURIComponent(options.params.baselineRunId)}&currentRunId=${encodeURIComponent(options.params.currentRunId)}`
+        ),
+        requestJson(
+          fetchImpl,
+          `${options.relay}/ai/diff/regression?baselineRunId=${encodeURIComponent(options.params.baselineRunId)}&currentRunId=${encodeURIComponent(options.params.currentRunId)}`
+        ),
+      ]);
+      const payload = {
+        ok: true,
+        scenarioDiff,
+        stateDiff,
+        regression: regression.regression,
+        blocking: regression.regression?.blockingDiffs || [],
+        nonBlocking: regression.regression?.nonBlockingDiffs || [],
+      };
+      const written = await maybeWriteArtifact(options.artifact, payload);
+      stdout(format({ ...payload, artifactPath: written }, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "ci" && command[1] === "readiness") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/verification-report`);
+      const readiness = payload.verificationReport?.runtimeReadiness;
+      const status =
+        readiness?.bestPracticeCompliant && readiness?.evidenceLevel === "runtime_verified"
+          ? "pass"
+          : "hold";
+      stdout(
+        format(
+          {
+            ok: true,
+            ci: {
+              status,
+              failedChecks: readiness?.missingSignals || ["missing_runtime_readiness"],
+              blockingReasons: readiness?.blockingReasons || ["missing_runtime_readiness"],
+              artifacts: [options.params.runId],
+              baselineRefs: payload.verificationReport?.releaseDecision?.baselineRefs || [],
+            },
+          },
+          options.pretty
+        )
+      );
+      return exitCodeFromCi(status);
+    }
+
+    if (command[0] === "ci" && command[1] === "scenario-smoke") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/scenario`);
+      const status = payload.scenario?.status === "passed" ? "pass" : payload.scenario?.status === "partially_observed" ? "manual_review_required" : "hold";
+      stdout(
+        format(
+          {
+            ok: true,
+            ci: {
+              status,
+              failedChecks: payload.scenario?.missingEvidence || [],
+              blockingReasons: payload.scenario?.blocking ? payload.scenario?.missingEvidence || [] : [],
+              artifacts: [options.params.runId],
+              baselineRefs: payload.scenario?.baselineKey ? [payload.scenario.baselineKey] : [],
+            },
+          },
+          options.pretty
+        )
+      );
+      return exitCodeFromCi(status);
+    }
+
+    if (command[0] === "ci" && command[1] === "closure") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/release-decision`);
+      const status = payload.releaseDecision?.decision === "ship" ? "pass" : payload.releaseDecision?.decision === "manual_review_required" ? "manual_review_required" : "hold";
+      stdout(
+        format(
+          {
+            ok: true,
+            ci: {
+              status,
+              failedChecks: payload.releaseDecision?.blockingItems || [],
+              blockingReasons: payload.releaseDecision?.blockingItems || [],
+              artifacts: [options.params.runId],
+              baselineRefs: payload.releaseDecision?.baselineRefs || [],
+            },
+          },
+          options.pretty
+        )
+      );
+      return exitCodeFromCi(status);
+    }
+
+    if (command[0] === "ci" && command[1] === "report") {
+      const payload = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/report`);
+      const status = payload.report?.releaseDecision?.decision === "ship" ? "pass" : payload.report?.releaseDecision?.decision === "manual_review_required" ? "manual_review_required" : "hold";
+      stdout(
+        format(
+          {
+            ok: true,
+            ci: {
+              status,
+              failedChecks: payload.report?.blockingItems || [],
+              blockingReasons: payload.report?.blockingItems || [],
+              artifacts: [options.params.runId],
+              baselineRefs: payload.report?.releaseDecision?.baselineRefs || [],
+            },
+          },
+          options.pretty
+        )
+      );
+      return exitCodeFromCi(status);
+    }
+
+    if (command[0] === "ci" && command[1] === "regression") {
+      const verification = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/verification-report`);
+      const baselineRunId = options.params.baselineRunId || verification.verificationReport?.closure?.baselineRunId || "";
+      const payload = await requestJson(
+        fetchImpl,
+        `${options.relay}/ai/diff/regression?baselineRunId=${encodeURIComponent(baselineRunId)}&currentRunId=${encodeURIComponent(options.params.runId)}${options.params.scenario ? `&scenarioId=${encodeURIComponent(options.params.scenario)}` : ""}`
+      );
+      const status = payload.regression?.decision === "ship" ? "pass" : payload.regression?.decision === "manual_review_required" ? "manual_review_required" : "hold";
+      stdout(
+        format(
+          {
+            ok: true,
+            ci: {
+              status,
+              failedChecks: payload.regression?.failedChecks || [],
+              blockingReasons: payload.regression?.blockingReasons || [],
+              artifacts: [options.params.runId],
+              baselineRefs: payload.regression?.baselineRefs || [],
+            },
+          },
+          options.pretty
+        )
+      );
+      return exitCodeFromCi(status);
+    }
+
     if (command[0] === "autoloop" && command[1] === "start") {
       const target = options.params.target || "web";
       const support = await fetchTargetSupport(fetchImpl, options.relay, target);
@@ -825,6 +1259,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         maxAttempts: options.params.maxAttempts ? Number(options.params.maxAttempts) : undefined,
         entryContext: {
           task: options.params.task || "",
+          projectRoot: resolveWorkspaceRoot(),
         },
       });
       stdout(format(payload, options.pretty));
@@ -865,7 +1300,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
     if (command[0] === "autoloop" && command[1] === "retest") {
       const mode = (options.params.mode || "fixed") as "baseline" | "broken" | "fixed";
       const runId = options.params.runId;
-      const result = await runWebScenario(fetchImpl, spawnImpl, options.relay, runId, mode);
+      const result = await runWebScenario(fetchImpl, spawnImpl, options.relay, runId, mode, options.params.baselineRunId);
       stdout(format({ ok: true, runId, mode, ...result }, options.pretty));
       return 0;
     }
@@ -983,6 +1418,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         maxAttempts: options.params.maxAttempts ? Number(options.params.maxAttempts) : 3,
         entryContext: {
           task: options.params.task || "auto_loop",
+          projectRoot: resolveWorkspaceRoot(),
         },
       });
 
@@ -992,7 +1428,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         baselineRunId,
         currentRunId: brokenRunId,
       });
-      const broken = await runWebScenario(fetchImpl, spawnImpl, options.relay, brokenRunId, "broken");
+      const broken = await runWebScenario(fetchImpl, spawnImpl, options.relay, brokenRunId, "broken", baselineRunId);
       const brokenDecision = await requestJson(fetchImpl, `${options.relay}/ai/autoloop/${autoloopId}/decision`);
       await postJson(fetchImpl, `${options.relay}/autoloops/${autoloopId}/attempts/${attempt1.attempt.id}/repair-outcome`, {
         changedFiles: ["examples/web-playwright/demo-page"],
@@ -1016,7 +1452,7 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
           baselineRunId,
           currentRunId: finalRunId,
         });
-        fixed = await runWebScenario(fetchImpl, spawnImpl, options.relay, finalRunId, "fixed");
+        fixed = await runWebScenario(fetchImpl, spawnImpl, options.relay, finalRunId, "fixed", baselineRunId);
         compare = await requestJson(fetchImpl, `${options.relay}/ai/diff?baselineRunId=${baselineRunId}&currentRunId=${finalRunId}`);
         const finalDecision = await requestJson(fetchImpl, `${options.relay}/ai/autoloop/${autoloopId}/decision`);
         await postJson(fetchImpl, `${options.relay}/autoloops/${autoloopId}/attempts/${attempt2.attempt.id}/repair-outcome`, {
@@ -1112,6 +1548,110 @@ export async function runCli(argv: string[], deps: CliDeps = {}): Promise<number
         )
       );
       return 0;
+    }
+
+    if (command[0] === "miniapp" && command[1] === "run") {
+      const [support, projectVerify, projectCheck] = await Promise.all([
+        fetchTargetSupport(fetchImpl, options.relay, "miniapp"),
+        projectVerifyPayload(fetchImpl, options.relay, "miniapp", options.params.runId),
+        requestJson(fetchImpl, `${options.relay}/ai/miniapp/project-check`),
+      ]);
+      if (isStructuredFailure(projectVerify)) {
+        stdout(format(projectVerify, options.pretty));
+        return 1;
+      }
+      const templateName = options.params.templateName || options.params.scenario || "miniapp_home_entry";
+      const scenarioCatalog = await requestJson(fetchImpl, `${options.relay}/ai/scenarios?target=miniapp`);
+      const scenario =
+        (scenarioCatalog.scenarios || []).find((item: Record<string, unknown>) => item.id === templateName || item.templateName === templateName) || null;
+      if (!scenario) {
+        stderr(`Unknown miniapp scenario template: ${templateName}\n`);
+        return 1;
+      }
+      const driver = options.params.driver || "devtools-automator";
+      const runStart = await createMiniappRun(fetchImpl, options.relay, options.params.label || templateName, driver, scenario.id);
+      const runId = runStart.runId as string;
+      const contract = await fetchDriverContract(fetchImpl, options.relay, { target: "miniapp", driver });
+      const execution = await runMiniappScenarioExecution(fetchImpl, options.relay, runId, driver, scenario, projectCheck.report, options.params.driverModule || "");
+      if (execution.status === "bridge_required") {
+        stdout(
+          format(
+            {
+              ok: true,
+              status: "bridge_required",
+              runId,
+              driver,
+              contract: contract.contract,
+              scenario,
+              driverResolution: execution.driverResolution,
+              executionLedger: execution.executionLedger,
+              actionPlan: execution.actionResults,
+              stopReason: execution.stopReason,
+              retrySummary: execution.retrySummary,
+              nextAction: "External agent must execute the declared actions and feed runtime events back into the relay before miniapp scenario/closure.",
+            },
+            options.pretty
+          )
+        );
+        return 0;
+      }
+      const scenarioResult = await postJson(fetchImpl, `${options.relay}/scenarios/validate`, {
+        runId,
+        templateName: scenario.id,
+        target: "miniapp",
+      });
+      const bundle = await fetchMiniappClosureBundle(fetchImpl, options.relay, runId);
+      const payload = {
+        ok: true,
+        support: support.report,
+        projectVerify,
+        runId,
+        driver,
+        contract: contract.contract,
+        scenario,
+        driverResolution: execution.driverResolution,
+        executionLedger: execution.executionLedger,
+        stopReason: execution.stopReason,
+        retrySummary: execution.retrySummary,
+        execution,
+        scenarioResult: scenarioResult.scenario,
+        ...bundle,
+      };
+      const written = await maybeWriteArtifact(options.artifact, payload);
+      stdout(format({ ...payload, artifactPath: written }, options.pretty));
+      return execution.status === "driver_not_available" ? 1 : 0;
+    }
+
+    if (command[0] === "miniapp" && command[1] === "scenario") {
+      const templateName = options.params.templateName || options.params.scenario || "miniapp_home_entry";
+      const payload = await postJson(fetchImpl, `${options.relay}/scenarios/validate`, {
+        runId: options.params.runId,
+        templateName,
+        target: "miniapp",
+      });
+      const observation = await requestJson(fetchImpl, `${options.relay}/ai/run/${options.params.runId}/miniapp-observation`);
+      stdout(format({ ok: true, scenario: payload.scenario, miniappObservation: observation.miniappObservation || observation.miniappSignals }, options.pretty));
+      return 0;
+    }
+
+    if (command[0] === "miniapp" && command[1] === "closure") {
+      const contract = await fetchDriverContract(fetchImpl, options.relay, {
+        target: "miniapp",
+        driver: options.params.driver || "external-agent",
+      });
+      const bundle = await fetchMiniappClosureBundle(fetchImpl, options.relay, options.params.runId);
+      stdout(
+        format(
+          {
+            ok: true,
+            runId: options.params.runId,
+            driverContract: contract.contract,
+            ...bundle,
+          },
+          options.pretty
+        )
+      );
+      return bundle.releaseDecision?.decision === "hold" ? 1 : 0;
     }
 
     stderr("Unknown command.\n");

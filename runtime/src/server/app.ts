@@ -175,6 +175,11 @@ function isRelayLogInput(payload: unknown): payload is RelayLogInput {
   return Boolean(input && isLogLevel(input.level) && typeof input.message === "string" && typeof input.source === "string");
 }
 
+function requestWorkspaceRoot(request: { headers: Record<string, unknown> }): string | undefined {
+  const value = request.headers["x-dev-log-relay-workspace-root"];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
 export function createRelayServer(config: RelayConfig): FastifyInstance {
   const server = Fastify({
     logger: true,
@@ -190,12 +195,22 @@ export function createRelayServer(config: RelayConfig): FastifyInstance {
   }));
 
   server.post("/runs/start", async (request, reply) => {
-    const run = engine.startRun(normalizeStartRun(request.body));
+    const input = normalizeStartRun(request.body);
+    const projectRoot = requestWorkspaceRoot(request);
+    if (projectRoot) {
+      input.metadata = { ...input.metadata, projectRoot };
+    }
+    const run = engine.startRun(input);
     return reply.send({ ok: true, runId: run.id, run });
   });
 
   server.post("/orchestrations/start", async (request, reply) => {
-    const { run, session } = ai.startOrchestration(normalizeOrchestrationStart(request.body));
+    const input = normalizeOrchestrationStart(request.body);
+    const projectRoot = requestWorkspaceRoot(request);
+    if (projectRoot) {
+      input.metadata = { ...input.metadata, projectRoot };
+    }
+    const { run, session } = ai.startOrchestration(input);
     return reply.send({
       ok: true,
       runId: run.id,
@@ -206,7 +221,12 @@ export function createRelayServer(config: RelayConfig): FastifyInstance {
   });
 
   server.post("/autoloops/start", async (request, reply) => {
-    const { run, orchestration, session } = ai.startAutoloop(normalizeAutoloopStart(request.body));
+    const input = normalizeAutoloopStart(request.body);
+    const projectRoot = requestWorkspaceRoot(request);
+    if (projectRoot) {
+      input.entryContext = { ...input.entryContext, projectRoot };
+    }
+    const { run, orchestration, session } = ai.startAutoloop(input);
     return reply.send({
       ok: true,
       autoloopId: session.id,
@@ -322,6 +342,14 @@ export function createRelayServer(config: RelayConfig): FastifyInstance {
     };
   });
 
+  server.get("/ai/targets/detect", async (request) => {
+    const query = request.query as Record<string, unknown>;
+    return {
+      ok: true,
+      detection: await ai.detectTarget(typeof query.target === "string" ? query.target : undefined, requestWorkspaceRoot(request)),
+    };
+  });
+
   server.get("/ai/web/integration-guide", async () => {
     return {
       ok: true,
@@ -373,13 +401,30 @@ export function createRelayServer(config: RelayConfig): FastifyInstance {
 
   server.post("/ai/project/identify", async (request, reply) => {
     const payload = asObject(request.body);
-    const profile = await ai.identifyProject(typeof payload.target === "string" ? payload.target : undefined);
+    const profile = await ai.identifyProject(typeof payload.target === "string" ? payload.target : undefined, requestWorkspaceRoot(request));
     if (!profile) {
       return reply.code(404).send({ ok: false, message: "project not identified" });
     }
     return {
       ok: true,
       profile,
+    };
+  });
+
+  server.get("/ai/project/compatibility", async (request, reply) => {
+    const query = request.query as Record<string, unknown>;
+    const compatibility = await ai.projectCompatibility(typeof query.target === "string" ? query.target : undefined, requestWorkspaceRoot(request));
+    if (!compatibility) {
+      return reply.code(404).send({ ok: false, message: "project compatibility unavailable" });
+    }
+    return { ok: true, compatibility };
+  });
+
+  server.get("/ai/project/resolution", async (request) => {
+    const query = request.query as Record<string, unknown>;
+    return {
+      ok: true,
+      resolution: await ai.projectResolution(typeof query.target === "string" ? query.target : undefined, requestWorkspaceRoot(request)),
     };
   });
 
@@ -418,18 +463,80 @@ export function createRelayServer(config: RelayConfig): FastifyInstance {
     return { ok: true, memory };
   });
 
-  server.get("/ai/web/project-check", async () => {
+  server.get("/ai/web/project-check", async (request) => {
     return {
       ok: true,
-      report: await ai.inspectWebProject(),
+      report: await ai.inspectWebProject(requestWorkspaceRoot(request)),
     };
   });
 
-  server.get("/ai/miniapp/project-check", async () => {
+  server.get("/ai/miniapp/project-check", async (request) => {
     return {
       ok: true,
-      report: await ai.inspectMiniappProject(),
+      report: await ai.inspectMiniappProject(requestWorkspaceRoot(request)),
     };
+  });
+
+  server.get("/ai/templates", async (request) => {
+    const query = request.query as Record<string, unknown>;
+    const target = isTarget(query.target) && query.target !== "mixed" ? query.target : undefined;
+    return {
+      ok: true,
+      templates: ai.scenarioTemplates(target),
+    };
+  });
+
+  server.get("/ai/scenarios", async (request) => {
+    const query = request.query as Record<string, unknown>;
+    const target = isTarget(query.target) && query.target !== "mixed" ? query.target : undefined;
+    const catalog = ai.projectScenarios(target);
+    return { ok: true, scenarios: catalog.scenarios.map((entry) => entry.scenario), catalog };
+  });
+
+  server.get("/ai/project/scenarios", async (request) => {
+    const query = request.query as Record<string, unknown>;
+    const target = isTarget(query.target) && query.target !== "mixed" ? query.target : undefined;
+    const catalog = ai.projectScenarios(target);
+    return { ok: true, scenarios: catalog.scenarios.map((entry) => entry.scenario), catalog };
+  });
+
+  server.get("/ai/project/baselines", async (request) => {
+    const query = request.query as Record<string, unknown>;
+    const target = isTarget(query.target) && query.target !== "mixed" ? query.target : undefined;
+    return { ok: true, baselines: ai.projectBaselines(target) };
+  });
+
+  server.get("/ai/scenario/inspect", async (request, reply) => {
+    const query = request.query as Record<string, unknown>;
+    const templateName = String(query.templateName || "");
+    if (!templateName) {
+      return reply.code(400).send({ ok: false, message: "templateName is required" });
+    }
+    const target = isTarget(query.target) && query.target !== "mixed" ? query.target : undefined;
+    return { ok: true, inspection: ai.scenarioInspect(templateName, target) };
+  });
+
+  server.post("/scenarios/validate", async (request, reply) => {
+    const payload = asObject(request.body);
+    const runId = String(payload.runId || "");
+    if (!runId) {
+      return reply.code(400).send({ ok: false, message: "runId is required" });
+    }
+    const templateName = typeof payload.templateName === "string" ? payload.templateName : "";
+    const spec =
+      payload.spec && typeof payload.spec === "object"
+        ? payload.spec
+        : templateName
+          ? ai.scenarioTemplates(isTarget(payload.target) && payload.target !== "mixed" ? payload.target : undefined).find((item) => item.id === templateName || item.templateName === templateName)
+          : null;
+    if (!spec) {
+      return reply.code(400).send({ ok: false, message: "scenario spec or valid templateName is required" });
+    }
+    const report = ai.scenarioValidate(runId, spec);
+    if (!report) {
+      return reply.code(404).send({ ok: false, message: "run not found" });
+    }
+    return { ok: true, scenario: report };
   });
 
   server.get<{ Params: { runId: string } }>("/ai/run/:runId/timeline", async (request, reply) => {
@@ -549,6 +656,24 @@ export function createRelayServer(config: RelayConfig): FastifyInstance {
     };
   });
 
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/actions", async (request, reply) => {
+    const run = engine.getRun(request.params.runId);
+    if (!run) return reply.code(404).send({ ok: false, message: "run not found" });
+    return { ok: true, actions: ai.runActions(request.params.runId) };
+  });
+
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/state-snapshots", async (request, reply) => {
+    const run = engine.getRun(request.params.runId);
+    if (!run) return reply.code(404).send({ ok: false, message: "run not found" });
+    return { ok: true, stateSnapshots: ai.runStateSnapshots(request.params.runId) };
+  });
+
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/request-attribution", async (request, reply) => {
+    const run = engine.getRun(request.params.runId);
+    if (!run) return reply.code(404).send({ ok: false, message: "run not found" });
+    return { ok: true, requestAttribution: ai.runRequestAttribution(request.params.runId) };
+  });
+
   server.get<{ Params: { runId: string } }>("/ai/run/:runId/report", async (request, reply) => {
     const report = ai.runReport(request.params.runId);
     if (!report) {
@@ -558,6 +683,18 @@ export function createRelayServer(config: RelayConfig): FastifyInstance {
       ok: true,
       report,
     };
+  });
+
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/release-decision", async (request, reply) => {
+    const releaseDecision = ai.runReleaseDecision(request.params.runId);
+    if (!releaseDecision) return reply.code(404).send({ ok: false, message: "run not found" });
+    return { ok: true, releaseDecision };
+  });
+
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/verification-report", async (request, reply) => {
+    const verificationReport = ai.runVerificationReport(request.params.runId);
+    if (!verificationReport) return reply.code(404).send({ ok: false, message: "run not found" });
+    return { ok: true, verificationReport };
   });
 
   server.get<{ Params: { runId: string } }>("/ai/run/:runId/driver-check", async (request, reply) => {
@@ -580,6 +717,14 @@ export function createRelayServer(config: RelayConfig): FastifyInstance {
     return { ok: true, failureChain: chain };
   });
 
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/root-cause-map", async (request, reply) => {
+    const rootCauseMap = ai.runRootCauseMap(request.params.runId);
+    if (!rootCauseMap) {
+      return reply.code(404).send({ ok: false, message: "run not found" });
+    }
+    return { ok: true, rootCauseMap };
+  });
+
   server.get<{ Params: { runId: string } }>("/ai/run/:runId/repair-strategy", async (request, reply) => {
     const strategy = ai.runRepairStrategy(request.params.runId);
     if (!strategy) {
@@ -596,12 +741,26 @@ export function createRelayServer(config: RelayConfig): FastifyInstance {
     return { ok: true, handoff };
   });
 
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/executable-handoff", async (request, reply) => {
+    const handoff = ai.runExecutableHandoff(request.params.runId);
+    if (!handoff) return reply.code(404).send({ ok: false, message: "run not found" });
+    return { ok: true, handoff };
+  });
+
   server.get<{ Params: { runId: string } }>("/ai/run/:runId/miniapp-signals", async (request, reply) => {
     const report = ai.runMiniappSignals(request.params.runId);
     if (!report) {
       return reply.code(404).send({ ok: false, message: "miniapp run not found" });
     }
     return { ok: true, miniappSignals: report };
+  });
+
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/miniapp-observation", async (request, reply) => {
+    const report = ai.runMiniappObservation(request.params.runId);
+    if (!report) {
+      return reply.code(404).send({ ok: false, message: "miniapp run not found" });
+    }
+    return { ok: true, miniappObservation: report };
   });
 
   server.get<{ Params: { runId: string } }>("/ai/run/:runId/collection", async (request, reply) => {
@@ -613,6 +772,30 @@ export function createRelayServer(config: RelayConfig): FastifyInstance {
       ok: true,
       collection: report,
     };
+  });
+
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/scenario", async (request, reply) => {
+    const scenario = ai.runScenario(request.params.runId);
+    if (!scenario) {
+      return reply.code(404).send({ ok: false, message: "scenario not found" });
+    }
+    return { ok: true, scenario };
+  });
+
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/state-report", async (request, reply) => {
+    const stateReport = ai.runStateReport(request.params.runId);
+    if (!stateReport) {
+      return reply.code(404).send({ ok: false, message: "state report not found" });
+    }
+    return { ok: true, stateReport };
+  });
+
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/baseline", async (request, reply) => {
+    const baseline = ai.runBaseline(request.params.runId);
+    if (!baseline) {
+      return reply.code(404).send({ ok: false, message: "baseline not found" });
+    }
+    return { ok: true, baseline };
   });
 
   server.get<{ Params: { runId: string } }>("/ai/run/:runId/hotspots", async (request, reply) => {
@@ -727,6 +910,59 @@ export function createRelayServer(config: RelayConfig): FastifyInstance {
       ok: true,
       ...ai.diff(baseline, current),
     };
+  });
+
+  server.get("/ai/diff/scenario", async (request) => {
+    const query = request.query as Record<string, unknown>;
+    return {
+      ok: true,
+      ...ai.runScenarioDiff(String(query.baselineRunId || ""), String(query.currentRunId || "")),
+    };
+  });
+
+  server.get("/ai/diff/regression", async (request, reply) => {
+    const query = request.query as Record<string, unknown>;
+    const baselineRunId = String(query.baselineRunId || "");
+    const currentRunId = String(query.currentRunId || "");
+    if (!baselineRunId || !currentRunId) {
+      return reply.code(400).send({ ok: false, message: "baselineRunId and currentRunId are required" });
+    }
+    return {
+      ok: true,
+      regression: ai.runRegressionDiff(baselineRunId, currentRunId, typeof query.scenarioId === "string" ? query.scenarioId : undefined),
+    };
+  });
+
+  server.get("/ai/diff/state", async (request) => {
+    const query = request.query as Record<string, unknown>;
+    return {
+      ok: true,
+      ...ai.runStateDiff(String(query.baselineRunId || ""), String(query.currentRunId || "")),
+    };
+  });
+
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/summary-view", async (request, reply) => {
+    const summary = ai.runSummaryView(request.params.runId);
+    if (!summary) {
+      return reply.code(404).send({ ok: false, message: "summary not found" });
+    }
+    return { ok: true, summary };
+  });
+
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/failure-report", async (request, reply) => {
+    const failureReport = ai.runFailureReport(request.params.runId);
+    if (!failureReport) {
+      return reply.code(404).send({ ok: false, message: "failure report not found" });
+    }
+    return { ok: true, failureReport };
+  });
+
+  server.get<{ Params: { runId: string } }>("/ai/run/:runId/pr-comment", async (request, reply) => {
+    const prComment = ai.runPrComment(request.params.runId);
+    if (!prComment) {
+      return reply.code(404).send({ ok: false, message: "pr comment not found" });
+    }
+    return { ok: true, prComment };
   });
 
   return server;

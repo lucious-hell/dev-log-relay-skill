@@ -132,20 +132,32 @@ export class AiQueryService {
     return this.engine.getDriverContract(target, driver);
   }
 
+  detectTarget(target?: string, projectRoot?: string) {
+    return this.engine.detectTarget(target, projectRoot);
+  }
+
+  projectCompatibility(target?: string, projectRoot?: string) {
+    return this.engine.getProjectCompatibility(target, projectRoot);
+  }
+
+  projectResolution(target?: string, projectRoot?: string) {
+    return this.engine.getProjectResolution(target, projectRoot);
+  }
+
   runDriverCheck(runId: string, driver?: string) {
     return this.engine.getDriverContractCompliance(runId, driver);
   }
 
-  identifyProject(target?: string) {
-    return this.engine.identifyProject(target);
+  identifyProject(target?: string, projectRoot?: string) {
+    return this.engine.identifyProject(target, projectRoot);
   }
 
-  inspectWebProject() {
-    return this.engine.inspectWebProject();
+  inspectWebProject(projectRoot?: string) {
+    return this.engine.inspectWebProject(projectRoot);
   }
 
-  inspectMiniappProject() {
-    return this.engine.inspectMiniappProject();
+  inspectMiniappProject(projectRoot?: string) {
+    return this.engine.inspectMiniappProject(projectRoot);
   }
 
   projectProfile(projectId: string) {
@@ -168,8 +180,24 @@ export class AiQueryService {
     return this.engine.getRunReadiness(runId);
   }
 
+  runActions(runId: string) {
+    return this.engine.getRunActions(runId);
+  }
+
+  runStateSnapshots(runId: string) {
+    return this.engine.getRunStateSnapshots(runId);
+  }
+
+  runRequestAttribution(runId: string) {
+    return this.engine.getRunRequestAttribution(runId);
+  }
+
   runFailureChain(runId: string) {
     return this.engine.getRunFailureChain(runId);
+  }
+
+  runRootCauseMap(runId: string) {
+    return this.engine.getRunRootCauseMap(runId);
   }
 
   runRepairStrategy(runId: string) {
@@ -180,12 +208,89 @@ export class AiQueryService {
     return this.engine.getRunHandoff(runId);
   }
 
+  runExecutableHandoff(runId: string) {
+    return this.engine.getExecutableHandoff(runId);
+  }
+
+  runReleaseDecision(runId: string) {
+    return this.engine.getRunReleaseDecision(runId);
+  }
+
+  runVerificationReport(runId: string) {
+    return this.engine.getRunVerificationReport(runId);
+  }
+
   runMiniappSignals(runId: string) {
+    return this.engine.getMiniappSignalReport(runId);
+  }
+
+  runMiniappObservation(runId: string) {
     return this.engine.getMiniappSignalReport(runId);
   }
 
   runArtifact(runId: string, filePath?: string) {
     return this.engine.getRunArtifact(runId, filePath);
+  }
+
+  scenarioTemplates(target?: TestTarget) {
+    return this.engine.listScenarioTemplates(target === "web" || target === "miniapp" ? target : undefined);
+  }
+
+  scenarioInspect(templateName: string, target?: TestTarget) {
+    return this.engine.inspectScenarioTemplate(templateName, target === "web" || target === "miniapp" ? target : undefined);
+  }
+
+  scenarioValidate(runId: string, spec: any) {
+    return this.engine.validateScenario(runId, spec);
+  }
+
+  runScenario(runId: string) {
+    return this.engine.getScenarioReport(runId);
+  }
+
+  projectScenarios(target?: TestTarget) {
+    return this.engine.listProjectScenarioCatalog(target === "web" || target === "miniapp" ? target : undefined);
+  }
+
+  projectBaselines(target?: TestTarget) {
+    return this.engine.listProjectBaselines(target === "web" || target === "miniapp" ? target : undefined);
+  }
+
+  runStateReport(runId: string) {
+    return this.engine.getScenarioReport(runId)?.stateReport || null;
+  }
+
+  runBaseline(runId: string) {
+    return this.engine.getBaseline(runId);
+  }
+
+  runScenarioDiff(baselineRunId: string, currentRunId: string) {
+    return this.engine.diffScenarioBaselines(baselineRunId, currentRunId);
+  }
+
+  runStateDiff(baselineRunId: string, currentRunId: string) {
+    const diff = this.engine.diffScenarioBaselines(baselineRunId, currentRunId);
+    return {
+      baselineFound: diff.baselineFound,
+      currentFound: diff.currentFound,
+      changed: diff.changed.filter((item) => item.kind === "state" || item.kind === "assertion"),
+    };
+  }
+
+  runRegressionDiff(baselineRunId: string, currentRunId: string, scenarioId?: string) {
+    return this.engine.getRegressionDiff(baselineRunId, currentRunId, scenarioId);
+  }
+
+  runSummaryView(runId: string) {
+    return this.engine.getShortHumanSummary(runId);
+  }
+
+  runFailureReport(runId: string) {
+    return this.engine.getFailureOnePager(runId);
+  }
+
+  runPrComment(runId: string) {
+    return this.engine.getPrCommentSummary(runId);
   }
 
   runReport(runId: string): ClosureEvidenceReport | null {
@@ -200,5 +305,9 @@ export class AiQueryService {
     closureClaim?: boolean;
   }): TaskEnforcementReport {
     return this.engine.getTaskEnforcement(input);
+  }
+
+  ciResult(mode: "readiness" | "scenario-smoke" | "closure" | "report" | "regression", runId?: string) {
+    return this.engine.getCiVerificationResult(mode, runId);
   }
 }

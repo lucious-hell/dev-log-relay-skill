@@ -34,6 +34,25 @@ export interface MiniappPatchResult {
   warnings: string[];
 }
 
+function uniqTags(tags: string[]): string[] {
+  return Array.from(new Set(tags.filter(Boolean)));
+}
+
+function getMiniappPageStack(): Array<{ route: string }> {
+  const getter = (globalThis as Record<string, any>).getCurrentPages;
+  if (typeof getter !== "function") return [];
+  try {
+    const pages = getter();
+    return Array.isArray(pages)
+      ? pages
+          .map((page) => ({ route: typeof page?.route === "string" ? page.route : "" }))
+          .filter((page) => page.route)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function stringifyArgs(args: unknown[]): string {
   return args
     .map((item) => {
@@ -87,6 +106,7 @@ export function createMiniappRelay(options: MiniappRelayOptions) {
   let runtimePatchCleanup: (() => void) | null = null;
   let lastPatchResult: MiniappPatchResult = { enabled: false, appliedCapabilities: [], warnings: [] };
   let wrapperUsed = false;
+  let requestCounter = 0;
   const observedSignals = {
     route: 0,
     lifecycle: 0,
@@ -132,6 +152,7 @@ export function createMiniappRelay(options: MiniappRelayOptions) {
     if (extra.phase === "navigation") observedSignals.route += 1;
     if (extra.phase === "lifecycle") observedSignals.lifecycle += 1;
     if (extra.phase === "network") observedSignals.network += 1;
+    const pageStack = getMiniappPageStack();
     rawRequest({
       url: options.endpoint,
       method: "POST",
@@ -139,10 +160,15 @@ export function createMiniappRelay(options: MiniappRelayOptions) {
         source,
         level,
         message,
-        route: extra.route || (options.routeProvider ? options.routeProvider() : ""),
+        route: extra.route || (options.routeProvider ? options.routeProvider() : "") || pageStack.at(-1)?.route || "",
         sessionId: extra.sessionId || (options.sessionIdProvider ? options.sessionIdProvider() : ""),
         runId: extra.runId || boundRunId,
         stepId: extra.stepId || boundStepId,
+        context: {
+          pageStackDepth: pageStack.length,
+          pageStackRoutes: pageStack.map((page) => page.route),
+          ...(extra.context || {}),
+        },
         ...extra,
       },
       fail() {},
@@ -181,10 +207,12 @@ export function createMiniappRelay(options: MiniappRelayOptions) {
     const original = wx.request.bind(wx);
     wx.request = (requestOptions: Record<string, any>) => {
       const start = Date.now();
+      const requestId = `miniapp-req-${++requestCounter}`;
       const url = String(requestOptions?.url || "");
       const method = String(requestOptions?.method || "GET");
       send("info", `wx.request ${method} ${url}`, {
         phase: "network",
+        requestId,
         network: { url, method, stage: "start" },
       });
       const success = requestOptions.success;
@@ -194,6 +222,7 @@ export function createMiniappRelay(options: MiniappRelayOptions) {
         success(response: any) {
           send(response?.statusCode && response.statusCode >= 400 ? "warn" : "info", `wx.request ${method} ${url} -> ${response?.statusCode || 200}`, {
             phase: "network",
+            requestId,
             network: {
               url,
               method,
@@ -210,6 +239,7 @@ export function createMiniappRelay(options: MiniappRelayOptions) {
         fail(error: any) {
           send("error", `wx.request ${method} ${url} failed`, {
             phase: "network",
+            requestId,
             errorKind: "network_error",
             stack: error?.errMsg || "",
             network: {
@@ -246,7 +276,11 @@ export function createMiniappRelay(options: MiniappRelayOptions) {
       wx[name] = (payload: Record<string, any>) => {
         send("info", `${name} ${String(payload?.url || "")}`.trim(), {
           phase: "navigation",
-          context: { payload },
+          tags: ["route_transition"],
+          context: {
+            payload,
+            destinationRoute: String(payload?.url || ""),
+          },
         });
         return original(payload);
       };
@@ -298,14 +332,20 @@ export function createMiniappRelay(options: MiniappRelayOptions) {
             send("info", `${name}.setData`, {
               phase: "lifecycle",
               component: name,
-              tags: ["setData"],
-              context: { kind, hookName, keys: relaySetData.keys || [] },
+              tags: ["setData", "state_update", "state_signature"],
+              context: {
+                kind,
+                hookName,
+                keys: relaySetData.keys || [],
+                stateSignature: (relaySetData.keys || []).slice().sort().join("|"),
+              },
             });
             return;
           }
           send("info", `${name}.${hookName}`, {
             phase: "lifecycle",
             component: name,
+            tags: ["lifecycle_hook"],
             context: { kind, hookName, args },
           });
         },
@@ -463,6 +503,7 @@ export function createMiniappRelay(options: MiniappRelayOptions) {
           "console",
           "wx-request",
           "wx-route",
+          "state-snapshot",
           "wrap-app",
           "wrap-page",
           "wrap-component",
@@ -486,8 +527,36 @@ export function createMiniappRelay(options: MiniappRelayOptions) {
         ...extra,
         phase: "lifecycle",
         component: pageName,
+        tags: uniqTags(["lifecycle_hook", ...(extra.tags || [])]),
         context: {
           hookName,
+          ...(extra.context || {}),
+        },
+      });
+    },
+    captureStateSnapshot(pageName: string, fields: Record<string, unknown>, extra: MiniappRelayExtra = {}) {
+      const keys = Object.keys(fields || {});
+      send("info", `${pageName}.state`, {
+        ...extra,
+        phase: "lifecycle",
+        component: pageName,
+        tags: uniqTags(["state_snapshot", "state_update", "state_signature", ...(extra.tags || [])]),
+        context: {
+          keys,
+          stateSignature: keys.slice().sort().join("|"),
+          fields,
+          ...(extra.context || {}),
+        },
+      });
+    },
+    captureRouteSnapshot(route: string, extra: MiniappRelayExtra = {}) {
+      send("info", `route ${route}`, {
+        ...extra,
+        route,
+        phase: "navigation",
+        tags: uniqTags(["route_transition", ...(extra.tags || [])]),
+        context: {
+          observedRoute: route,
           ...(extra.context || {}),
         },
       });

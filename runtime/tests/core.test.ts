@@ -26,6 +26,26 @@ const config: RelayConfig = {
   projectMemoryDir: path.join(artifactDir, "project-memory"),
 };
 
+async function createMiniappProjectFixture() {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-miniapp-closure-"));
+  await writeFile(path.join(tempDir, "project.config.json"), JSON.stringify({ miniprogramRoot: "src/miniprogram" }), "utf8");
+  await mkdir(path.join(tempDir, "src/miniprogram/pages/home"), { recursive: true });
+  await writeFile(
+    path.join(tempDir, "src/miniprogram/app.json"),
+    JSON.stringify({
+      pages: ["pages/home/index"],
+    }),
+    "utf8"
+  );
+  await writeFile(path.join(tempDir, "src/miniprogram/app.ts"), "App({})\n", "utf8");
+  await writeFile(
+    path.join(tempDir, "src/miniprogram/pages/home/index.ts"),
+    "Page({ onLoad() { wx.request({ url: '/home' }) } })\n",
+    "utf8"
+  );
+  return tempDir;
+}
+
 test("fingerprint remains stable for dynamic ids", () => {
   const a = buildFingerprint({
     source: "miniapp",
@@ -531,6 +551,24 @@ test("cli can run autoloop and miniapp verify flows", async () => {
         : { ok: true, closure: { decision: { status: "unresolved" }, evidence: [], confidence: 0.8 } };
     } else if (url.endsWith("/integrity")) {
       body = { ok: true, integrity: { runId: "broken-run", integrityScore: 90, warnings: [] } };
+    } else if (url.endsWith("/scenario")) {
+      body = {
+        ok: true,
+        scenario: {
+          runId: url.includes("fixed-run") ? "fixed-run" : "broken-run",
+          scenarioId: "request_to_ui_continuity",
+          status: url.includes("fixed-run") ? "passed" : "partially_observed",
+        },
+      };
+    } else if (url.endsWith("/baseline")) {
+      body = {
+        ok: true,
+        baseline: {
+          runId: url.includes("fixed-run") ? "fixed-run" : "broken-run",
+          scenarioId: "request_to_ui_continuity",
+          evidenceLayer: url.includes("fixed-run") ? "user_flow_closed" : "runtime_events_observed",
+        },
+      };
     } else if (url.endsWith("/repair-brief")) {
       body = { ok: true, repairBrief: { successCriteria: ["closure resolved"] } };
     } else if (url.includes("/ai/autoloop/") && url.endsWith("/decision")) {
@@ -539,6 +577,10 @@ test("cli can run autoloop and miniapp verify flows", async () => {
         : { ok: true, decision: { status: "escalated", shouldContinue: true, nextAction: "repair_and_retest", confidence: 0.7, evidence: [] } };
     } else if (url.includes("/ai/autoloop/")) {
       body = { ok: true, autoloop: { session: { id: "loop-1" }, attempts: [], decision: { status: "resolved" } } };
+    } else if (url.includes("/ai/diff/scenario")) {
+      body = { ok: true, baselineFound: true, currentFound: true, changed: [{ kind: "state", key: "request_done->ui_updated", status: "added" }] };
+    } else if (url.includes("/ai/diff/state")) {
+      body = { ok: true, changed: [{ transition: "request_done->ui_updated", status: "added" }] };
     } else if (url.includes("/ai/diff")) {
       body = { ok: true, changed: [{ fingerprint: "abc", status: "resolved" }] };
     } else if (url.endsWith("/report")) {
@@ -1006,6 +1048,7 @@ test("miniapp adapter supports wrappers, runtime patch, and self-check", async (
   const originalApp = (globalThis as any).App;
   const originalPage = (globalThis as any).Page;
   const originalComponent = (globalThis as any).Component;
+  const originalGetCurrentPages = (globalThis as any).getCurrentPages;
 
   (globalThis as any).wx = {
     request(options: Record<string, any>) {
@@ -1022,6 +1065,7 @@ test("miniapp adapter supports wrappers, runtime patch, and self-check", async (
   (globalThis as any).App = (config: Record<string, any>) => config;
   (globalThis as any).Page = (config: Record<string, any>) => config;
   (globalThis as any).Component = (config: Record<string, any>) => config;
+  (globalThis as any).getCurrentPages = () => [{ route: "pages/index" }];
 
   const relay = createMiniappRelay({
     endpoint: "http://relay.test/ingest",
@@ -1038,6 +1082,8 @@ test("miniapp adapter supports wrappers, runtime patch, and self-check", async (
   wrappedPage.onLoad();
   const patch = relay.enableMiniappRuntimePatch();
   relay.capturePageLifecycle("IndexPage", "onLoad");
+  relay.captureRouteSnapshot("/pages/index");
+  relay.captureStateSnapshot("IndexPage", { list: [], ready: true });
   relay.startAutoCapture();
   (globalThis as any).wx.request({ url: "https://api.example.com/demo", method: "POST" });
   const check = relay.selfCheck();
@@ -1046,6 +1092,9 @@ test("miniapp adapter supports wrappers, runtime patch, and self-check", async (
 
   assert.ok(calls.some((item) => item.phase === "lifecycle" && item.component === "IndexPage"));
   assert.ok(calls.some((item) => item.phase === "network"));
+  assert.ok(calls.some((item) => Array.isArray(item.tags) && (item.tags as string[]).includes("state_signature")));
+  assert.ok(calls.some((item) => item.phase === "navigation" && Array.isArray(item.tags) && (item.tags as string[]).includes("route_transition")));
+  assert.ok(calls.some((item) => typeof item.requestId === "string"));
   assert.ok(calls.some((item) => item.runId === "run-2" && item.stepId === "step-2"));
   assert.equal(check.runBound, true);
   assert.ok(patch.appliedCapabilities.length >= 2);
@@ -1054,6 +1103,7 @@ test("miniapp adapter supports wrappers, runtime patch, and self-check", async (
   (globalThis as any).App = originalApp;
   (globalThis as any).Page = originalPage;
   (globalThis as any).Component = originalComponent;
+  (globalThis as any).getCurrentPages = originalGetCurrentPages;
 });
 
 test("backend adapter reports binding state and self-check", () => {
@@ -1067,4 +1117,1073 @@ test("backend adapter reports binding state and self-check", () => {
   const check = relay.selfCheck();
   assert.equal(state.runId, "run-3");
   assert.equal(check.runBound, true);
+});
+
+test("project detection, scenario validation, and baseline diff work together", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-web-project-"));
+  await writeFile(
+    path.join(tempDir, "package.json"),
+    JSON.stringify({
+      name: "demo-web",
+      dependencies: { react: "^18.0.0", vite: "^5.0.0" },
+    }),
+    "utf8"
+  );
+  await mkdir(path.join(tempDir, "src"), { recursive: true });
+  await writeFile(path.join(tempDir, "src/main.tsx"), "console.log('boot')\n", "utf8");
+  await writeFile(path.join(tempDir, "src/router.ts"), "export const router = {}\n", "utf8");
+  await writeFile(path.join(tempDir, "src/api.ts"), "export async function load() {}\n", "utf8");
+
+  const previousCwd = process.cwd();
+  try {
+    process.chdir(tempDir);
+    const engine = new RelayEngine(config);
+    const detection = await engine.detectTarget("auto");
+    assert.equal(detection.detectedTarget, "web");
+    assert.ok(detection.confidence > 0.4);
+
+    const baselineRun = engine.startRun({ label: "baseline scenario", target: "web" });
+    const baselineStep = engine.startStep(baselineRun.id, { name: "open", kind: "navigate", route: "/list" });
+    engine.ingest({ source: "admin-web", level: "info", message: "route changed", phase: "navigation", runId: baselineRun.id, stepId: baselineStep?.id, route: "/list" });
+    engine.ingest({ source: "admin-web", level: "info", message: "GET /api/list", phase: "network", runId: baselineRun.id, stepId: baselineStep?.id, route: "/list", network: { url: "/api/list", method: "GET", stage: "success" } });
+    engine.ingest({ source: "admin-web", level: "info", message: "render_complete list", phase: "render", tags: ["render_complete"], runId: baselineRun.id, stepId: baselineStep?.id, route: "/list" });
+    engine.endStep(baselineRun.id, baselineStep!.id, { status: "passed" });
+    engine.endRun(baselineRun.id, { status: "passed" });
+    const scenario1 = engine.validateScenario(baselineRun.id, {
+      id: "request_to_ui_continuity",
+      target: "web",
+      entry: { route: "/list" },
+      steps: [
+        { id: "route", kind: "route_change", route: "/list" },
+        { id: "request", kind: "wait_request_complete", eventPhase: "network" },
+        { id: "render", kind: "wait_render", eventPhase: "render", match: "render_complete" },
+      ],
+      expectations: [],
+      fallbacks: [],
+      assertions: [{ id: "continuity", type: "continuity", match: "render_complete" }],
+      stateTransitions: [{ from: "request_done", to: "ui_updated", evidenceMatch: "render_complete" }],
+    });
+    assert.equal(scenario1?.status, "passed");
+    const baselineSnapshot = engine.captureBaseline(baselineRun.id);
+    assert.ok(baselineSnapshot);
+
+    const currentRun = engine.startRun({ label: "current scenario", target: "web" });
+    const currentStep = engine.startStep(currentRun.id, { name: "open", kind: "navigate", route: "/list" });
+    engine.ingest({ source: "admin-web", level: "info", message: "route changed", phase: "navigation", runId: currentRun.id, stepId: currentStep?.id, route: "/list" });
+    engine.ingest({ source: "admin-web", level: "warn", message: "GET /api/list failed", phase: "network", runId: currentRun.id, stepId: currentStep?.id, route: "/list", network: { url: "/api/list", method: "GET", stage: "fail", ok: false } });
+    engine.endStep(currentRun.id, currentStep!.id, { status: "failed" });
+    engine.endRun(currentRun.id, { status: "failed" });
+    const scenario2 = engine.validateScenario(currentRun.id, {
+      id: "request_to_ui_continuity",
+      target: "web",
+      entry: { route: "/list" },
+      steps: [
+        { id: "route", kind: "route_change", route: "/list" },
+        { id: "request", kind: "wait_request_complete", eventPhase: "network" },
+        { id: "render", kind: "wait_render", eventPhase: "render", match: "render_complete" },
+      ],
+      expectations: [],
+      fallbacks: [],
+      assertions: [{ id: "continuity", type: "continuity", match: "render_complete" }],
+      stateTransitions: [{ from: "request_done", to: "ui_updated", evidenceMatch: "render_complete" }],
+    });
+    assert.equal(scenario2?.status, "partially_observed");
+
+    const diff = engine.diffScenarioBaselines(baselineRun.id, currentRun.id);
+    assert.ok(diff.changed.some((item) => item.kind === "signal" || item.kind === "state"));
+    const summary = engine.getShortHumanSummary(currentRun.id);
+    assert.ok(summary?.topFindings.length);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test("scenario validation requires request-to-render continuity in sequence", () => {
+  const engine = new RelayEngine(config);
+  const run = engine.startRun({ label: "ordering-check", target: "web" });
+  const step = engine.startStep(run.id, { name: "load", kind: "navigate", route: "/list" });
+  engine.ingest({ source: "admin-web", level: "info", message: "render_complete early", phase: "render", tags: ["render_complete"], runId: run.id, stepId: step?.id, route: "/list" });
+  engine.ingest({
+    source: "admin-web",
+    level: "info",
+    message: "GET /api/list -> 200",
+    phase: "network",
+    runId: run.id,
+    stepId: step?.id,
+    route: "/list",
+    network: { url: "/api/list", method: "GET", stage: "success", ok: true },
+  });
+  engine.endStep(run.id, step!.id, { status: "failed" });
+  engine.endRun(run.id, { status: "failed" });
+
+  const scenario = engine.validateScenario(run.id, {
+    id: "request_to_ui_continuity",
+    target: "web",
+    entry: { route: "/list" },
+    steps: [
+      { id: "request", kind: "wait_request_complete", eventPhase: "network" },
+      { id: "render", kind: "wait_render", eventPhase: "render", match: "render_complete" },
+    ],
+    expectations: [],
+    fallbacks: [],
+    assertions: [{ id: "continuity", type: "continuity", match: "render_complete" }],
+    stateTransitions: [{ from: "request_done", to: "ui_updated", evidenceMatch: "render_complete" }],
+  });
+  assert.equal(scenario?.status, "partially_observed");
+  assert.ok(scenario?.missingEvidence.includes("step:render"));
+  assert.ok(scenario?.missingEvidence.includes("assertion:continuity"));
+});
+
+test("miniapp detection respects project.config source root and subpackage pages", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-miniapp-project-"));
+  await writeFile(path.join(tempDir, "project.config.json"), JSON.stringify({ miniprogramRoot: "src/miniprogram" }), "utf8");
+  await mkdir(path.join(tempDir, "src/miniprogram/pages/home"), { recursive: true });
+  await mkdir(path.join(tempDir, "src/miniprogram/pkgA/detail"), { recursive: true });
+  await writeFile(
+    path.join(tempDir, "src/miniprogram/app.json"),
+    JSON.stringify({
+      pages: ["pages/home/index"],
+      subPackages: [{ root: "pkgA", pages: ["detail/index"] }],
+    }),
+    "utf8"
+  );
+  await writeFile(path.join(tempDir, "src/miniprogram/app.ts"), "import { wrapApp } from 'relay';\nApp(wrapApp({}))\n", "utf8");
+  await writeFile(path.join(tempDir, "src/miniprogram/pages/home/index.ts"), "Page({ onLoad() {}, onShow() {} })\n", "utf8");
+  await writeFile(path.join(tempDir, "src/miniprogram/pkgA/detail/index.js"), "Page({ onLoad() { wx.request({ url: '/detail' }) } })\n", "utf8");
+
+  const previousCwd = process.cwd();
+  try {
+    process.chdir(tempDir);
+    const engine = new RelayEngine(config);
+    const detection = await engine.detectTarget("auto");
+    assert.equal(detection.detectedTarget, "miniapp");
+    assert.notEqual(detection.status, "unsupported");
+
+    const report = await engine.inspectMiniappProject();
+    assert.equal(report.projectConfigEntry, "project.config.json");
+    assert.equal(report.sourceRoot, "src/miniprogram");
+    assert.equal(report.resolvedMiniappRoot, "src/miniprogram");
+    assert.equal(report.pageMap?.includes("pages/home/index"), true);
+    assert.equal(report.pageMap?.includes("pkgA/detail/index"), true);
+    assert.equal(report.pageResolutionCoverage, 100);
+    assert.equal(report.pageCoverage, 100);
+    assert.equal(report.resolvedPageFiles?.includes("pages/home/index"), true);
+    assert.equal(report.resolvedPageFiles?.includes("pkgA/detail/index"), true);
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test("miniapp compatibility does not over-claim route and page coverage from declarations alone", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-miniapp-partial-"));
+  await writeFile(path.join(tempDir, "project.config.json"), JSON.stringify({ miniprogramRoot: "miniprogram" }), "utf8");
+  await mkdir(path.join(tempDir, "miniprogram/pages/home"), { recursive: true });
+  await writeFile(
+    path.join(tempDir, "miniprogram/app.json"),
+    JSON.stringify({
+      pages: ["pages/home/index", "pages/missing/index"],
+    }),
+    "utf8"
+  );
+  await writeFile(path.join(tempDir, "miniprogram/app.ts"), "App({})\n", "utf8");
+  await writeFile(path.join(tempDir, "miniprogram/pages/home/index.ts"), "Page({})\n", "utf8");
+
+  const previousCwd = process.cwd();
+  try {
+    process.chdir(tempDir);
+    const engine = new RelayEngine(config);
+    const report = await engine.inspectMiniappProject();
+    assert.equal(report.status, "partial");
+    assert.equal(report.pageCoverage, 50);
+    assert.equal(report.pageResolutionCoverage, 50);
+    assert.equal(report.routeCoverage < 100, true);
+    assert.ok(report.blockingIssues.includes("partial_page_resolution"));
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test("server project inspection honors request workspace root instead of server cwd", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-header-root-"));
+  await writeFile(
+    path.join(tempDir, "package.json"),
+    JSON.stringify({
+      name: "header-root-web",
+      dependencies: { react: "^18.0.0", vite: "^5.0.0" },
+    }),
+    "utf8"
+  );
+  await mkdir(path.join(tempDir, "src"), { recursive: true });
+  await writeFile(path.join(tempDir, "src/main.tsx"), "console.log('boot')\n", "utf8");
+
+  const server = createRelayServer(config);
+  const headers = { "x-dev-log-relay-workspace-root": tempDir };
+  const [detected, resolution, projectCheck] = await Promise.all([
+    server.inject({ method: "GET", url: "/ai/targets/detect?target=auto", headers }),
+    server.inject({ method: "GET", url: "/ai/project/resolution?target=auto", headers }),
+    server.inject({ method: "GET", url: "/ai/web/project-check", headers }),
+  ]);
+
+  assert.equal(detected.statusCode, 200);
+  assert.equal(detected.json().detection.detectedTarget, "web");
+  assert.equal(resolution.statusCode, 200);
+  assert.equal(resolution.json().resolution.workspaceRoot, tempDir);
+  assert.equal(projectCheck.statusCode, 200);
+  assert.equal(projectCheck.json().report.framework, "react-vite");
+  await server.close();
+});
+
+test("server exposes detection, scenario, baseline, and summary endpoints", async () => {
+  const server = createRelayServer(config);
+  const detected = await server.inject({ method: "GET", url: "/ai/targets/detect?target=auto" });
+  assert.equal(detected.statusCode, 200);
+  assert.ok(detected.json().detection);
+
+  const runStart = await server.inject({
+    method: "POST",
+    url: "/runs/start",
+    payload: { label: "scenario endpoints", target: "web" },
+  });
+  const runId = runStart.json().runId as string;
+  const stepStart = await server.inject({
+    method: "POST",
+    url: `/runs/${runId}/steps/start`,
+    payload: { name: "load", kind: "navigate", route: "/demo" },
+  });
+  const stepId = stepStart.json().stepId as string;
+  await server.inject({
+    method: "POST",
+    url: "/ingest",
+    payload: { source: "admin-web", level: "info", message: "route changed", phase: "navigation", runId, stepId, route: "/demo" },
+  });
+  await server.inject({
+    method: "POST",
+    url: "/ingest",
+    payload: { source: "admin-web", level: "info", message: "GET /api/demo", phase: "network", runId, stepId, route: "/demo", network: { url: "/api/demo", method: "GET", stage: "success" } },
+  });
+  await server.inject({
+    method: "POST",
+    url: "/ingest",
+    payload: { source: "admin-web", level: "info", message: "render_complete demo", phase: "render", tags: ["render_complete"], runId, stepId, route: "/demo" },
+  });
+  await server.inject({ method: "POST", url: `/runs/${runId}/steps/${stepId}/end`, payload: { status: "passed" } });
+  await server.inject({ method: "POST", url: `/runs/${runId}/end`, payload: { status: "passed" } });
+
+  const scenario = await server.inject({
+    method: "POST",
+    url: "/scenarios/validate",
+    payload: { runId, templateName: "request_to_ui_continuity", target: "web" },
+  });
+  assert.equal(scenario.statusCode, 200);
+
+  const scenarioView = await server.inject({ method: "GET", url: `/ai/run/${runId}/scenario` });
+  assert.equal(scenarioView.statusCode, 200);
+  const baseline = await server.inject({ method: "GET", url: `/ai/run/${runId}/baseline` });
+  assert.equal(baseline.statusCode, 200);
+  const summary = await server.inject({ method: "GET", url: `/ai/run/${runId}/summary-view` });
+  assert.equal(summary.statusCode, 200);
+  const prComment = await server.inject({ method: "GET", url: `/ai/run/${runId}/pr-comment` });
+  assert.equal(prComment.statusCode, 200);
+  const rootCauseMap = await server.inject({ method: "GET", url: `/ai/run/${runId}/root-cause-map` });
+  assert.equal(rootCauseMap.statusCode, 200);
+
+  await server.close();
+});
+
+test("cli exposes detect, scenario, baseline, and summary commands", async () => {
+  const outputs: string[] = [];
+  const fetchImpl: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes("/ai/targets/detect")) {
+      return new Response(JSON.stringify({ ok: true, detection: { detectedTarget: "web", status: "detected_supported" } }), { status: 200 });
+    }
+    if (url.includes("/scenarios/validate")) {
+      return new Response(JSON.stringify({ ok: true, scenario: { runId: "run-1", scenarioId: "request_to_ui_continuity", status: "passed" } }), { status: 200 });
+    }
+    if (url.includes("/ai/run/run-1/baseline")) {
+      return new Response(JSON.stringify({ ok: true, baseline: { runId: "run-1", scenarioId: "request_to_ui_continuity" } }), { status: 200 });
+    }
+    if (url.includes("/ai/diff/scenario")) {
+      return new Response(JSON.stringify({ ok: true, changed: [{ kind: "state", key: "request_done->ui_updated" }] }), { status: 200 });
+    }
+    if (url.includes("/ai/diff/state")) {
+      return new Response(JSON.stringify({ ok: true, changed: [{ kind: "state", key: "request_done->ui_updated" }] }), { status: 200 });
+    }
+    if (url.includes("/ai/run/run-1/summary-view")) {
+      return new Response(JSON.stringify({ ok: true, summary: { title: "Run run-1", verdict: "resolved" } }), { status: 200 });
+    }
+    if (url.includes("/ai/run/run-1/failure-report")) {
+      return new Response(JSON.stringify({ ok: true, failureReport: { runId: "run-1" } }), { status: 200 });
+    }
+    if (url.includes("/ai/run/run-1/pr-comment")) {
+      return new Response(JSON.stringify({ ok: true, prComment: { verdict: "resolved" } }), { status: 200 });
+    }
+    if (url.includes("/ai/templates")) {
+      return new Response(JSON.stringify({ ok: true, templates: [{ id: "request_to_ui_continuity" }] }), { status: 200 });
+    }
+    if (url.includes("/ai/project/compatibility")) {
+      return new Response(JSON.stringify({ ok: true, compatibility: { target: "web", relayInsertionReadiness: "ready" } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ ok: true, method: init?.method || "GET" }), { status: 200 });
+  }) as typeof fetch;
+
+  assert.equal(await runCli(["doctor", "detect", "--target", "auto"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  assert.ok(outputs.join("").includes("detected_supported"));
+  outputs.length = 0;
+
+  assert.equal(await runCli(["template", "list"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  assert.ok(outputs.join("").includes("request_to_ui_continuity"));
+  outputs.length = 0;
+
+  assert.equal(await runCli(["project", "compatibility", "--target", "web"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  assert.ok(outputs.join("").includes("relayInsertionReadiness"));
+  outputs.length = 0;
+
+  assert.equal(await runCli(["scenario", "validate", "--runId", "run-1", "--templateName", "request_to_ui_continuity"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  assert.ok(outputs.join("").includes("scenarioId"));
+  outputs.length = 0;
+
+  assert.equal(await runCli(["baseline", "compare", "--baselineRunId", "base-1", "--currentRunId", "run-1"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  assert.ok(outputs.join("").includes("scenarioDiff"));
+  outputs.length = 0;
+
+  assert.equal(await runCli(["ai", "summary", "--runId", "run-1"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  assert.ok(outputs.join("").includes("Run run-1"));
+  outputs.length = 0;
+
+  assert.equal(await runCli(["ai", "failure-report", "--runId", "run-1"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  assert.ok(outputs.join("").includes("failureReport"));
+  outputs.length = 0;
+
+  assert.equal(await runCli(["ai", "pr-comment", "--runId", "run-1"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  assert.ok(outputs.join("").includes("prComment"));
+});
+
+test("cli loop web keeps runner stdout out of top-level machine output", async () => {
+  const outputs: string[] = [];
+  const fetchImpl: typeof fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/ai/targets/support")) {
+      return new Response(JSON.stringify({ ok: true, report: { target: "web", status: "supported", reasonCode: "web_supported", reason: "supported", recommendedAction: "relay loop web", supportedTargets: ["web", "miniapp"], currentCapabilities: ["driver"], recommendedIntegrationMode: "browser-injected", evidenceSource: "runtime_relay" } }), { status: 200 });
+    }
+    if (url.endsWith("/orchestrations/start")) {
+      return new Response(JSON.stringify({ ok: true, runId: "run-loop-1" }), { status: 200 });
+    }
+    if (url.includes("/summary")) {
+      return new Response(JSON.stringify({ ok: true, summary: { runId: "run-loop-1" } }), { status: 200 });
+    }
+    if (url.includes("/collection")) {
+      return new Response(JSON.stringify({ ok: true, collection: { runId: "run-loop-1", status: "complete", signalGaps: [] } }), { status: 200 });
+    }
+    if (url.includes("/diagnosis")) {
+      return new Response(JSON.stringify({ ok: true, diagnosis: { runId: "run-loop-1", suspectedRootCauses: [], missingSignals: [], topIncidents: [] } }), { status: 200 });
+    }
+    if (url.includes("/closure")) {
+      return new Response(JSON.stringify({ ok: true, closure: { decision: { status: "resolved" } } }), { status: 200 });
+    }
+    if (url.includes("/integrity")) {
+      return new Response(JSON.stringify({ ok: true, integrity: { runId: "run-loop-1", integrityScore: 100, warnings: [] } }), { status: 200 });
+    }
+    if (url.includes("/scenario")) {
+      return new Response(JSON.stringify({ ok: true, scenario: { runId: "run-loop-1", scenarioId: "request_to_ui_continuity", status: "passed" } }), { status: 200 });
+    }
+    if (url.includes("/baseline")) {
+      return new Response(JSON.stringify({ ok: true, baseline: { runId: "run-loop-1", scenarioId: "request_to_ui_continuity", evidenceLayer: "user_flow_closed" } }), { status: 200 });
+    }
+    if (url.includes("/report")) {
+      return new Response(JSON.stringify({ ok: true, report: { runId: "run-loop-1", verdict: { status: "resolved" } } }), { status: 200 });
+    }
+    if (url.includes("/artifact")) {
+      return new Response(JSON.stringify({ ok: true, artifact: { run: { id: "run-loop-1" } }, filePath: "/tmp/run-loop-1.json" }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ ok: true, changed: [] }), { status: 200 });
+  }) as typeof fetch;
+
+  const spawnImpl = ((_: string, __: readonly string[]) => {
+    const child = new EventEmitter() as unknown as ReturnType<typeof spawn> & { stdout?: EventEmitter; stderr?: EventEmitter };
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    queueMicrotask(() => {
+      child.stdout?.emit("data", '{\n  "ok": true,\n  "fromRunner": true\n}\n');
+      child.emit("exit", 0);
+    });
+    return child;
+  }) as any;
+
+  const code = await runCli(["loop", "web", "--mode", "baseline"], {
+    fetchImpl,
+    spawnImpl,
+    stdout: (text) => outputs.push(text),
+    stderr: (text) => outputs.push(text),
+  });
+  assert.equal(code, 0);
+  assert.equal(outputs.length, 1);
+  const parsed = JSON.parse(outputs[0]);
+  assert.equal(parsed.runId, "run-loop-1");
+  assert.equal(parsed.exampleEvidence?.fromRunner, true);
+});
+
+test("project resolution handles monorepo next apps and exposes resolution report", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-next-monorepo-"));
+  await writeFile(
+    path.join(tempDir, "package.json"),
+    JSON.stringify({
+      name: "mono-root",
+      workspaces: ["apps/*", "packages/*"],
+    }),
+    "utf8"
+  );
+  await mkdir(path.join(tempDir, "apps/admin/app"), { recursive: true });
+  await writeFile(
+    path.join(tempDir, "apps/admin/package.json"),
+    JSON.stringify({
+      name: "admin",
+      dependencies: { next: "^15.0.0", react: "^18.0.0" },
+    }),
+    "utf8"
+  );
+  await writeFile(path.join(tempDir, "apps/admin/app/layout.tsx"), "export default function Layout() { return null }\n", "utf8");
+  await writeFile(path.join(tempDir, "apps/admin/app/error.tsx"), "export default function Error() { return null }\n", "utf8");
+
+  const previousCwd = process.cwd();
+  try {
+    process.chdir(tempDir);
+    const engine = new RelayEngine(config);
+    const resolution = await engine.getProjectResolution("auto");
+    assert.equal(resolution.target, "web");
+    assert.equal(resolution.packageTopology.monorepo, true);
+    assert.equal(resolution.framework, "nextjs");
+    assert.ok(resolution.entrypoints.some((item) => item.path.includes("app/layout")));
+  } finally {
+    process.chdir(previousCwd);
+  }
+});
+
+test("release decision and executable handoff distinguish integration from business failure", () => {
+  const engine = new RelayEngine(config);
+  const run = engine.startRun({ label: "business failure", target: "web", metadata: { driver: "computer-use" } });
+  const step = engine.startStep(run.id, { name: "load detail", kind: "navigate", route: "/detail" });
+  engine.ingest({ source: "admin-web", level: "info", message: "route changed", phase: "navigation", runId: run.id, stepId: step?.id, route: "/detail" });
+  engine.ingest({ source: "admin-web", level: "info", message: "GET /api/detail", phase: "network", runId: run.id, stepId: step?.id, route: "/detail", network: { url: "/api/detail", method: "GET", stage: "success" } });
+  engine.ingest({ source: "admin-web", level: "info", message: "render_complete detail", phase: "render", tags: ["render_complete"], runId: run.id, stepId: step?.id, route: "/detail" });
+  engine.ingest({ source: "admin-web", level: "error", message: "detail empty state broken", runId: run.id, stepId: step?.id, route: "/detail" });
+  engine.endStep(run.id, step!.id, { status: "failed" });
+  engine.endRun(run.id, { status: "failed" });
+
+  const release = engine.getRunReleaseDecision(run.id);
+  assert.equal(release?.decision, "hold");
+  assert.ok(release?.blockingItems.length);
+
+  const handoff = engine.getExecutableHandoff(run.id);
+  assert.equal(handoff?.failureFamily, "business_failure");
+  assert.ok(handoff?.recommendedInvestigationEntry.length);
+});
+
+test("run-scoped action, state, request attribution, and CI result are derived", () => {
+  const engine = new RelayEngine(config);
+  const run = engine.startRun({ label: "ci run", target: "web", metadata: { driver: "computer-use" } });
+  const step = engine.startStep(run.id, { name: "open home", kind: "navigate", route: "/" });
+  engine.ingest({ source: "admin-web", level: "info", message: "route changed", phase: "navigation", runId: run.id, stepId: step?.id, route: "/" });
+  engine.ingest({ source: "admin-web", level: "info", message: "GET /api/home", phase: "network", runId: run.id, stepId: step?.id, route: "/", network: { url: "/api/home", method: "GET", stage: "success" } });
+  engine.ingest({ source: "admin-web", level: "info", message: "render_complete home", phase: "render", tags: ["render_complete"], runId: run.id, stepId: step?.id, route: "/" });
+  engine.ingest({
+    source: "admin-web",
+    level: "info",
+    message: "home state applied",
+    phase: "lifecycle",
+    tags: ["state_update"],
+    context: { state: "ready" },
+    runId: run.id,
+    stepId: step?.id,
+    route: "/",
+  });
+  engine.endStep(run.id, step!.id, { status: "passed" });
+  engine.endRun(run.id, { status: "passed" });
+  engine.validateScenario(run.id, engine.getScenarioTemplate("web_home_cold_start", "web")!);
+
+  const actions = engine.getRunActions(run.id);
+  const snapshots = engine.getRunStateSnapshots(run.id);
+  const attribution = engine.getRunRequestAttribution(run.id);
+  const ci = engine.getCiVerificationResult("closure", run.id);
+
+  assert.equal(actions.length, 1);
+  assert.ok(snapshots.length >= 1);
+  assert.ok(attribution.length >= 1);
+  assert.equal(ci.recommendedExitCode, 2);
+});
+
+test("request attribution distinguishes missing state after render", () => {
+  const engine = new RelayEngine(config);
+  const run = engine.startRun({ label: "attribution gap", target: "web" });
+  const step = engine.startStep(run.id, { name: "load", kind: "navigate", route: "/" });
+  engine.ingest({ source: "admin-web", level: "info", message: "GET /api/home", phase: "network", runId: run.id, stepId: step?.id, route: "/", network: { url: "/api/home", method: "GET", stage: "success" } });
+  engine.ingest({ source: "admin-web", level: "info", message: "render only", phase: "render", runId: run.id, stepId: step?.id, route: "/" });
+  engine.endStep(run.id, step!.id, { status: "passed" });
+  engine.endRun(run.id, { status: "passed" });
+
+  const attribution = engine.getRunRequestAttribution(run.id);
+  assert.equal(attribution[0]?.attributionStatus, "missing_state");
+});
+
+test("miniapp run-scoped observation requires request to lifecycle/state continuity", () => {
+  const engine = new RelayEngine(config);
+  const run = engine.startRun({ label: "miniapp observe", target: "miniapp" });
+  const step = engine.startStep(run.id, { name: "open home", kind: "navigate", route: "/pages/home/index", metadata: { projectRoot: "/tmp/demo-miniapp" } });
+  engine.ingest({
+    source: "miniapp",
+    level: "info",
+    message: "navigateTo /pages/home/index",
+    phase: "navigation",
+    tags: ["route_transition"],
+    runId: run.id,
+    stepId: step?.id,
+    route: "/pages/home/index",
+    context: { destinationRoute: "/pages/home/index", pageStackRoutes: ["pages/home/index"] },
+  });
+  engine.ingest({
+    source: "miniapp",
+    level: "info",
+    message: "HomePage.onLoad",
+    phase: "lifecycle",
+    tags: ["lifecycle_hook"],
+    runId: run.id,
+    stepId: step?.id,
+    route: "/pages/home/index",
+    context: { hookName: "onLoad" },
+  });
+  engine.ingest({
+    source: "miniapp",
+    level: "info",
+    message: "wx.request GET /home",
+    phase: "network",
+    requestId: "req-1",
+    runId: run.id,
+    stepId: step?.id,
+    route: "/pages/home/index",
+    network: { url: "/home", method: "GET", stage: "success", ok: true },
+  });
+  engine.ingest({
+    source: "miniapp",
+    level: "info",
+    message: "HomePage.setData",
+    phase: "lifecycle",
+    tags: ["setData", "state_update", "state_signature"],
+    runId: run.id,
+    stepId: step?.id,
+    route: "/pages/home/index",
+    context: { hookName: "onLoad", keys: ["list", "ready"], stateSignature: "list|ready" },
+  });
+  engine.endStep(run.id, step!.id, { status: "passed" });
+  engine.endRun(run.id, { status: "passed" });
+
+  const observation = engine.getMiniappSignalReport(run.id);
+  const readiness = engine.getRunReadiness(run.id);
+  const attribution = engine.getRunRequestAttribution(run.id);
+
+  assert.equal(observation?.observationReady, true);
+  assert.equal(observation?.requestAttributionCoverage, 100);
+  assert.ok(observation?.stateSignatures.includes("list|ready"));
+  assert.equal(readiness?.bestPracticeCompliant, true);
+  assert.equal(attribution[0]?.attributionStatus, "attributed");
+});
+
+test("miniapp request attribution distinguishes missing lifecycle from missing state", () => {
+  const engine = new RelayEngine(config);
+  const run = engine.startRun({ label: "miniapp gaps", target: "miniapp" });
+  const step = engine.startStep(run.id, { name: "open", kind: "navigate", route: "/pages/gap/index" });
+  engine.ingest({
+    source: "miniapp",
+    level: "info",
+    message: "wx.request GET /gap",
+    phase: "network",
+    runId: run.id,
+    stepId: step?.id,
+    route: "/pages/gap/index",
+    network: { url: "/gap", method: "GET", stage: "success", ok: true },
+  });
+  engine.ingest({
+    source: "miniapp",
+    level: "info",
+    message: "GapPage.onLoad",
+    phase: "lifecycle",
+    tags: ["lifecycle_hook"],
+    runId: run.id,
+    stepId: step?.id,
+    route: "/pages/gap/index",
+    context: { hookName: "onLoad" },
+  });
+  engine.endStep(run.id, step!.id, { status: "passed" });
+  engine.endRun(run.id, { status: "passed" });
+
+  const attribution = engine.getRunRequestAttribution(run.id);
+  assert.equal(attribution[0]?.attributionStatus, "missing_state");
+
+  const run2 = engine.startRun({ label: "miniapp no lifecycle", target: "miniapp" });
+  const step2 = engine.startStep(run2.id, { name: "open", kind: "navigate", route: "/pages/gap2/index" });
+  engine.ingest({
+    source: "miniapp",
+    level: "info",
+    message: "wx.request GET /gap2",
+    phase: "network",
+    runId: run2.id,
+    stepId: step2?.id,
+    route: "/pages/gap2/index",
+    network: { url: "/gap2", method: "GET", stage: "success", ok: true },
+  });
+  engine.endStep(run2.id, step2!.id, { status: "passed" });
+  engine.endRun(run2.id, { status: "passed" });
+
+  const attribution2 = engine.getRunRequestAttribution(run2.id);
+  assert.equal(attribution2[0]?.attributionStatus, "missing_lifecycle");
+});
+
+test("miniapp release decision upgrades from hold to ship only after blocking scenario passes", () => {
+  const engine = new RelayEngine(config);
+  const run = engine.startRun({ label: "miniapp closure", target: "miniapp", metadata: { driver: "devtools-automator" } });
+  const step = engine.startStep(run.id, {
+    name: "enter home",
+    kind: "navigate",
+    route: "/pages/home/index",
+    metadata: { actionType: "enter_page", pagePath: "/pages/home/index", triggerSource: "reference_driver" },
+  });
+  engine.ingest({
+    source: "miniapp",
+    level: "info",
+    message: "navigateTo /pages/home/index",
+    phase: "navigation",
+    tags: ["route_transition"],
+    runId: run.id,
+    stepId: step?.id,
+    route: "/pages/home/index",
+    context: { destinationRoute: "/pages/home/index", pageStackRoutes: ["pages/home/index"] },
+  });
+  engine.ingest({
+    source: "miniapp",
+    level: "info",
+    message: "HomePage.onLoad",
+    phase: "lifecycle",
+    tags: ["lifecycle_hook", "ready"],
+    runId: run.id,
+    stepId: step?.id,
+    route: "/pages/home/index",
+    context: { hookName: "onLoad" },
+  });
+  engine.ingest({
+    source: "miniapp",
+    level: "info",
+    message: "wx.request GET /home",
+    phase: "network",
+    requestId: "req-miniapp-1",
+    runId: run.id,
+    stepId: step?.id,
+    route: "/pages/home/index",
+    network: { url: "/home", method: "GET", stage: "success", ok: true },
+  });
+  engine.ingest({
+    source: "miniapp",
+    level: "info",
+    message: "HomePage.setData ready",
+    phase: "lifecycle",
+    tags: ["setData", "state_update", "state_signature", "ready"],
+    runId: run.id,
+    stepId: step?.id,
+    route: "/pages/home/index",
+    context: { hookName: "onLoad", keys: ["list", "ready"], stateSignature: "list|ready" },
+  });
+  engine.endStep(run.id, step!.id, { status: "passed" });
+  engine.endRun(run.id, { status: "passed" });
+
+  const beforeScenario = engine.getRunReleaseDecision(run.id);
+  assert.equal(beforeScenario?.decision, "hold");
+  assert.ok(beforeScenario?.blockingItems.includes("missing_scenario_validation"));
+
+  const scenario = engine.validateScenario(run.id, engine.getScenarioTemplate("miniapp_home_entry", "miniapp")!);
+  assert.equal(scenario?.status, "passed");
+
+  const afterScenario = engine.getRunReleaseDecision(run.id);
+  assert.equal(afterScenario?.decision, "ship");
+  assert.equal(afterScenario?.evidenceLayer, "user_flow_closed");
+});
+
+test("server exposes miniapp observation alias alongside legacy miniapp signals", async () => {
+  const server = createRelayServer(config);
+  const runStart = await server.inject({
+    method: "POST",
+    url: "/runs/start",
+    payload: { label: "miniapp observation alias", target: "miniapp", metadata: { driver: "devtools-automator" } },
+  });
+  const runId = runStart.json().runId as string;
+  const stepStart = await server.inject({
+    method: "POST",
+    url: `/runs/${runId}/steps/start`,
+    payload: {
+      name: "enter home",
+      kind: "navigate",
+      route: "/pages/home/index",
+      metadata: { actionType: "enter_page", pagePath: "/pages/home/index", triggerSource: "reference_driver" },
+    },
+  });
+  const stepId = stepStart.json().stepId as string;
+  await server.inject({
+    method: "POST",
+    url: "/ingest",
+    payload: {
+      runId,
+      stepId,
+      records: [
+        {
+          source: "miniapp",
+          level: "info",
+          message: "navigateTo /pages/home/index",
+          phase: "navigation",
+          route: "/pages/home/index",
+          tags: ["route_transition"],
+          context: { destinationRoute: "/pages/home/index", pageStackRoutes: ["pages/home/index"] },
+        },
+        {
+          source: "miniapp",
+          level: "info",
+          message: "HomePage.onLoad",
+          phase: "lifecycle",
+          route: "/pages/home/index",
+          tags: ["lifecycle_hook"],
+          context: { hookName: "onLoad" },
+        },
+        {
+          source: "miniapp",
+          level: "info",
+          message: "wx.request GET /home",
+          phase: "network",
+          route: "/pages/home/index",
+          requestId: "server-miniapp-1",
+          network: { url: "/home", method: "GET", stage: "success", ok: true },
+        },
+        {
+          source: "miniapp",
+          level: "info",
+          message: "HomePage.setData ready",
+          phase: "lifecycle",
+          route: "/pages/home/index",
+          tags: ["setData", "state_update", "state_signature"],
+          context: { hookName: "onLoad", keys: ["list", "ready"], stateSignature: "list|ready" },
+        },
+      ],
+    },
+  });
+  await server.inject({ method: "POST", url: `/runs/${runId}/steps/${stepId}/end`, payload: { status: "passed" } });
+  await server.inject({ method: "POST", url: `/runs/${runId}/end`, payload: { status: "passed" } });
+
+  const [alias, legacy] = await Promise.all([
+    server.inject({ method: "GET", url: `/ai/run/${runId}/miniapp-observation` }),
+    server.inject({ method: "GET", url: `/ai/run/${runId}/miniapp-signals` }),
+  ]);
+  assert.equal(alias.statusCode, 200);
+  assert.equal(legacy.statusCode, 200);
+  assert.equal(alias.json().miniappObservation.observationReady, true);
+  assert.equal(alias.json().miniappObservation.requestAttributionCoverage, legacy.json().miniappSignals.requestAttributionCoverage);
+  await server.close();
+});
+
+test("cli miniapp run, scenario, closure, and external bridge produce run-scoped closure outputs", async () => {
+  const workspaceRoot = await createMiniappProjectFixture();
+  const fixtureModule = path.join(process.cwd(), "tests/fixtures/miniapp-driver-module.mjs");
+  const server = createRelayServer({ ...config, port: 0 });
+  const relay = await server.listen({ port: 0, host: "127.0.0.1" });
+  const relayUrl = typeof relay === "string" ? relay.replace(/\/$/, "") : `http://127.0.0.1:${config.port}`;
+  const previousWorkspaceRoot = process.env.DEV_LOG_RELAY_WORKSPACE_ROOT;
+  const outputs: string[] = [];
+
+  process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = workspaceRoot;
+  try {
+    const runCode = await runCli(
+      ["miniapp", "run", "--relay", relayUrl, "--driver", "devtools-automator", "--driverModule", fixtureModule, "--templateName", "miniapp_home_entry"],
+      {
+        stdout: (text) => outputs.push(text),
+        stderr: (text) => outputs.push(text),
+      }
+    );
+    assert.equal(runCode, 0);
+    const runPayload = JSON.parse(outputs.join(""));
+    assert.equal(runPayload.ok, true);
+    assert.equal(runPayload.execution.status, "executed");
+    assert.equal(runPayload.scenarioResult.status, "passed");
+    assert.equal(runPayload.miniappObservation.observationReady, true);
+    assert.equal(runPayload.contract.target, "miniapp");
+    assert.ok(["ship", "manual_review_required"].includes(runPayload.releaseDecision.decision));
+
+    outputs.length = 0;
+    const scenarioCode = await runCli(
+      ["miniapp", "scenario", "--relay", relayUrl, "--runId", runPayload.runId, "--templateName", "miniapp_home_entry"],
+      {
+        stdout: (text) => outputs.push(text),
+        stderr: (text) => outputs.push(text),
+      }
+    );
+    assert.equal(scenarioCode, 0);
+    const scenarioPayload = JSON.parse(outputs.join(""));
+    assert.equal(scenarioPayload.scenario.status, "passed");
+    assert.equal(scenarioPayload.miniappObservation.observationReady, true);
+
+    outputs.length = 0;
+    const closureCode = await runCli(
+      ["miniapp", "closure", "--relay", relayUrl, "--runId", runPayload.runId, "--driver", "devtools-automator"],
+      {
+        stdout: (text) => outputs.push(text),
+        stderr: (text) => outputs.push(text),
+      }
+    );
+    const closurePayload = JSON.parse(outputs.join(""));
+    assert.equal(closurePayload.runId, runPayload.runId);
+    assert.equal(closurePayload.driverContract.target, "miniapp");
+    assert.ok(["ship", "manual_review_required"].includes(closurePayload.releaseDecision.decision));
+    assert.equal(closureCode, closurePayload.releaseDecision.decision === "hold" ? 1 : 0);
+
+    outputs.length = 0;
+    const bridgeCode = await runCli(["miniapp", "run", "--relay", relayUrl, "--driver", "external-agent", "--templateName", "miniapp_home_entry"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(bridgeCode, 0);
+    const bridgePayload = JSON.parse(outputs.join(""));
+    assert.equal(bridgePayload.status, "bridge_required");
+    assert.ok(Array.isArray(bridgePayload.actionPlan));
+    assert.ok(bridgePayload.actionPlan.length > 0);
+    assert.equal(bridgePayload.contract.target, "miniapp");
+
+    const bridgeClosure = await server.inject({ method: "GET", url: `/ai/run/${bridgePayload.runId}/closure` });
+    assert.equal(bridgeClosure.statusCode, 200);
+    assert.equal(bridgeClosure.json().closure.decision.status, "running");
+  } finally {
+    process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = previousWorkspaceRoot;
+    await server.close();
+  }
+});
+
+test("server exposes project resolution, release decision, run-scoped views, and executable handoff", async () => {
+  const server = createRelayServer(config);
+  const runStart = await server.inject({
+    method: "POST",
+    url: "/runs/start",
+    payload: { label: "extended endpoints", target: "web", metadata: { driver: "computer-use" } },
+  });
+  const runId = runStart.json().runId as string;
+  const stepStart = await server.inject({
+    method: "POST",
+    url: `/runs/${runId}/steps/start`,
+    payload: { name: "load", kind: "navigate", route: "/" },
+  });
+  const stepId = stepStart.json().stepId as string;
+  await server.inject({ method: "POST", url: "/ingest", payload: { source: "admin-web", level: "info", message: "route changed", phase: "navigation", runId, stepId, route: "/" } });
+  await server.inject({ method: "POST", url: "/ingest", payload: { source: "admin-web", level: "info", message: "GET /api/home", phase: "network", runId, stepId, route: "/", network: { url: "/api/home", method: "GET", stage: "success" } } });
+  await server.inject({ method: "POST", url: "/ingest", payload: { source: "admin-web", level: "info", message: "render_complete home", phase: "render", tags: ["render_complete"], runId, stepId, route: "/" } });
+  await server.inject({ method: "POST", url: `/runs/${runId}/steps/${stepId}/end`, payload: { status: "passed" } });
+  await server.inject({ method: "POST", url: `/runs/${runId}/end`, payload: { status: "passed" } });
+  await server.inject({ method: "POST", url: "/scenarios/validate", payload: { runId, templateName: "web_home_cold_start", target: "web" } });
+
+  const [resolution, actions, stateSnapshots, requestAttribution, releaseDecision, verificationReport, handoff] = await Promise.all([
+    server.inject({ method: "GET", url: "/ai/project/resolution?target=auto" }),
+    server.inject({ method: "GET", url: `/ai/run/${runId}/actions` }),
+    server.inject({ method: "GET", url: `/ai/run/${runId}/state-snapshots` }),
+    server.inject({ method: "GET", url: `/ai/run/${runId}/request-attribution` }),
+    server.inject({ method: "GET", url: `/ai/run/${runId}/release-decision` }),
+    server.inject({ method: "GET", url: `/ai/run/${runId}/verification-report` }),
+    server.inject({ method: "GET", url: `/ai/run/${runId}/executable-handoff` }),
+  ]);
+
+  assert.equal(resolution.statusCode, 200);
+  assert.equal(actions.statusCode, 200);
+  assert.equal(stateSnapshots.statusCode, 200);
+  assert.equal(requestAttribution.statusCode, 200);
+  assert.equal(releaseDecision.statusCode, 200);
+  assert.equal(verificationReport.statusCode, 200);
+  assert.equal(handoff.statusCode, 200);
+  await server.close();
+});
+
+test("cli exposes scenario list and CI commands with stable exit codes", async () => {
+  const outputs: string[] = [];
+  const fetchImpl: typeof fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/ai/scenarios")) {
+      return new Response(JSON.stringify({ ok: true, scenarios: [{ id: "web_home_cold_start" }] }), { status: 200 });
+    }
+    if (url.includes("/ai/project/scenarios")) {
+      return new Response(JSON.stringify({ ok: true, scenarios: [{ id: "miniapp_home_entry" }] }), { status: 200 });
+    }
+    if (url.includes("/ai/project/baselines")) {
+      return new Response(JSON.stringify({ ok: true, baselines: { entries: [{ baselineKey: "miniapp_home_entry:home" }] } }), { status: 200 });
+    }
+    if (url.includes("/ai/scenario/inspect")) {
+      return new Response(JSON.stringify({ ok: true, inspection: { found: true, resolvedFrom: "project_local" } }), { status: 200 });
+    }
+    if (url.includes("/ai/diff/regression")) {
+      return new Response(JSON.stringify({ ok: true, regression: { decision: "hold", failedChecks: ["request:GET /home:removed"], blockingReasons: ["request:GET /home:removed"], baselineRefs: ["run:baseline-1"] } }), { status: 200 });
+    }
+    if (url.includes("/verification-report")) {
+      return new Response(JSON.stringify({ ok: true, verificationReport: { runtimeReadiness: { bestPracticeCompliant: false, evidenceLevel: "project_only", missingSignals: ["render"], blockingReasons: ["render"] }, closure: { baselineRunId: "baseline-1" }, releaseDecision: { decision: "manual_review_required", baselineRefs: ["run:baseline-1"] }, blockingItems: ["runtime_not_observed"] } }), { status: 200 });
+    }
+    if (url.includes("/release-decision")) {
+      return new Response(JSON.stringify({ ok: true, releaseDecision: { decision: "hold", blockingItems: ["assertion_failed"], baselineRefs: ["run:baseline-1"] } }), { status: 200 });
+    }
+    if (url.includes("/scenario")) {
+      return new Response(JSON.stringify({ ok: true, scenario: { status: "passed", missingEvidence: [], baselineKey: "miniapp_home_entry:home" } }), { status: 200 });
+    }
+    if (url.includes("/report")) {
+      return new Response(JSON.stringify({ ok: true, report: { releaseDecision: { decision: "ship" }, blockingItems: [] } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  }) as typeof fetch;
+
+  assert.equal(await runCli(["scenario", "list"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  assert.ok(outputs.join("").includes("web_home_cold_start"));
+  outputs.length = 0;
+
+  assert.equal(await runCli(["project", "scenarios"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  assert.ok(outputs.join("").includes("miniapp_home_entry"));
+  outputs.length = 0;
+
+  assert.equal(await runCli(["project", "baselines"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  assert.ok(outputs.join("").includes("miniapp_home_entry:home"));
+  outputs.length = 0;
+
+  assert.equal(await runCli(["scenario", "inspect", "--templateName", "miniapp_home_entry"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  assert.ok(outputs.join("").includes("project_local"));
+  outputs.length = 0;
+
+  assert.equal(await runCli(["ci", "readiness", "--runId", "run-1"], { fetchImpl, stdout: (text) => outputs.push(text) }), 3);
+  outputs.length = 0;
+  assert.equal(await runCli(["ci", "closure", "--runId", "run-1"], { fetchImpl, stdout: (text) => outputs.push(text) }), 3);
+  outputs.length = 0;
+  assert.equal(await runCli(["ci", "report", "--runId", "run-1"], { fetchImpl, stdout: (text) => outputs.push(text) }), 0);
+  outputs.length = 0;
+  assert.equal(await runCli(["ci", "regression", "--runId", "run-1"], { fetchImpl, stdout: (text) => outputs.push(text) }), 3);
+});
+
+test("engine loads local scenario catalog and baseline registry, and regression diff classifies blocking changes", async () => {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-scenarios-"));
+  await mkdir(path.join(workspaceRoot, "tooling/scenarios"), { recursive: true });
+  await mkdir(path.join(workspaceRoot, "tooling/baselines"), { recursive: true });
+  await writeFile(
+    path.join(workspaceRoot, "tooling/scenarios/miniapp_checkout.json"),
+    JSON.stringify({
+      id: "miniapp_checkout_submit",
+      target: "miniapp",
+      pageKey: "checkout",
+      templateName: "miniapp_checkout_submit",
+      blockingByDefault: true,
+      baselinePolicy: "when_passed",
+      entry: { page: "/pages/checkout/index" },
+      steps: [
+        { id: "route", kind: "route_change", eventPhase: "navigation", route: "/pages/checkout/index" },
+        { id: "request", kind: "wait_request_complete", eventPhase: "network" },
+      ],
+      expectations: ["checkout request completes"],
+      fallbacks: [],
+      assertions: [{ id: "ready", type: "continuity", match: "ready", blocking: true }],
+      stateTransitions: [{ from: "loading", to: "ready", evidenceMatch: "ready" }],
+    }),
+    "utf8"
+  );
+  await writeFile(
+    path.join(workspaceRoot, "tooling/baselines/miniapp_checkout.json"),
+    JSON.stringify({
+      runId: "baseline-file",
+      scenarioId: "miniapp_checkout_submit",
+      pageKey: "checkout",
+      baselineKey: "miniapp_checkout_submit:checkout",
+      keyStepSequence: ["navigate:checkout"],
+      requestSequence: ["GET /checkout"],
+      stateSignatures: ["ready"],
+      stateTransitions: ["loading->ready"],
+      assertionResults: [{ id: "ready", status: "passed" }],
+      signalPresence: ["network", "lifecycle"],
+      evidenceLayer: "user_flow_closed",
+    }),
+    "utf8"
+  );
+
+  const previousRoot = process.env.DEV_LOG_RELAY_WORKSPACE_ROOT;
+  process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = workspaceRoot;
+  try {
+    const engine = new RelayEngine(config);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const catalog = engine.listProjectScenarioCatalog("miniapp");
+    assert.ok(catalog.scenarios.some((entry) => entry.scenario.id === "miniapp_checkout_submit" && entry.source === "project_local"));
+
+    const baselines = engine.listProjectBaselines("miniapp");
+    assert.ok(baselines.entries.some((entry) => entry.scenarioId === "miniapp_checkout_submit" && entry.source === "project_local"));
+
+    const baselineRun = engine.startRun({ label: "baseline", target: "miniapp" });
+    const baselineStep = engine.startStep(baselineRun.id, {
+      name: "checkout baseline",
+      kind: "navigate",
+      route: "/pages/checkout/index",
+      metadata: { actionType: "enter_page", pagePath: "/pages/checkout/index" },
+    });
+    assert.ok(baselineStep);
+    engine.ingest({
+      source: "miniapp",
+      level: "info",
+      message: "route ready",
+      runId: baselineRun.id,
+      stepId: baselineStep!.id,
+      route: "/pages/checkout/index",
+      phase: "navigation",
+      tags: ["route_transition"],
+    });
+    engine.ingest({
+      source: "miniapp",
+      level: "info",
+      message: "checkout request ready",
+      runId: baselineRun.id,
+      stepId: baselineStep!.id,
+      route: "/pages/checkout/index",
+      phase: "network",
+      network: { url: "/checkout", method: "GET", statusCode: 200, ok: true, stage: "complete" },
+      tags: ["ready"],
+    });
+    engine.endStep(baselineRun.id, baselineStep!.id, { status: "passed" });
+    engine.endRun(baselineRun.id, { status: "passed" });
+    engine.validateScenario(baselineRun.id, engine.getScenarioTemplate("miniapp_checkout_submit", "miniapp")!);
+
+    const currentRun = engine.startRun({ label: "current", target: "miniapp" });
+    const currentStep = engine.startStep(currentRun.id, {
+      name: "checkout current",
+      kind: "navigate",
+      route: "/pages/checkout/index",
+      metadata: { actionType: "enter_page", pagePath: "/pages/checkout/index" },
+    });
+    assert.ok(currentStep);
+    engine.ingest({
+      source: "miniapp",
+      level: "info",
+      message: "route ready",
+      runId: currentRun.id,
+      stepId: currentStep!.id,
+      route: "/pages/checkout/index",
+      phase: "navigation",
+      tags: ["route_transition"],
+    });
+    engine.ingest({
+      source: "miniapp",
+      level: "info",
+      message: "checkout request changed",
+      runId: currentRun.id,
+      stepId: currentStep!.id,
+      route: "/pages/checkout/index",
+      phase: "network",
+      network: { url: "/checkout?mode=fast", method: "GET", statusCode: 200, ok: true, stage: "complete" },
+    });
+    engine.endStep(currentRun.id, currentStep!.id, { status: "passed" });
+    engine.endRun(currentRun.id, { status: "passed" });
+    engine.validateScenario(currentRun.id, engine.getScenarioTemplate("miniapp_checkout_submit", "miniapp")!);
+
+    const regression = engine.getRegressionDiff(baselineRun.id, currentRun.id, "miniapp_checkout_submit");
+    assert.equal(regression.decision, "hold");
+    assert.ok(regression.blockingDiffs.length > 0);
+    assert.ok(regression.failedChecks.some((item) => item.includes("request:GET /checkout")));
+  } finally {
+    process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = previousRoot;
+  }
 });

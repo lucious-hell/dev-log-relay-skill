@@ -34,10 +34,17 @@ Common Chinese trigger phrases:
 
 1. Detect target and trigger need
 2. Verify project integration readiness
-3. Start or inspect a run
-4. Bind relay to the active run/step and drive the target flow
-5. Check `collection`, then `diagnosis`, then `closure`
-6. If closure fails, produce `handoff`
+3. Separate evidence level:
+   - `project_structure`
+   - `instrumentation_attached`
+   - `runtime_events_observed`
+   - `user_flow_closed`
+4. Start or inspect a run
+5. Bind relay to the active run/step and drive or observe the target flow
+6. Prefer scenario/template validation when it is available
+7. Check `collection`, then `diagnosis`, then `closure`
+8. Read `release decision`
+9. If closure fails or release is blocked, produce `handoff`
 
 ## Default Evidence Report
 
@@ -63,7 +70,20 @@ Prefer the bundled wrapper scripts in `scripts/` instead of typing raw runtime c
 - `scripts/agent-contract.sh`
 - `scripts/web-autoloop.sh`
 - `scripts/miniapp-verify.sh`
+- `scripts/miniapp-run.sh`
+- `scripts/miniapp-scenario.sh`
+- `scripts/miniapp-closure.sh`
 - `scripts/handoff.sh`
+
+If you need deeper protocol endpoints, prefer:
+
+- `relay scenario list`
+- `relay scenario inspect`
+- `relay project scenarios`
+- `relay project baselines`
+- `relay ai release-decision --runId <runId>`
+- `relay ai verification-report --runId <runId>`
+- `relay ci readiness|scenario-smoke|closure|report|regression --runId <runId>`
 
 These wrappers now auto-start the local relay backend when needed. Treat them as the execution surface behind the skill, not as user-facing ceremony.
 
@@ -76,11 +96,17 @@ If you need the detailed policy, read:
 ## Required Rules
 
 - For Web runtime work, verify the project first, then run the closed loop
-- For Miniapp runtime work, verify first; do not claim closure before readiness is good enough
+- For Miniapp runtime work, verify first, then run the executable closure chain: `miniapp run -> miniapp scenario -> miniapp closure`
 - Treat `project verify` without a real `runId` as project inspection only, not runtime proof
 - Only treat `/ai/run/:runId/readiness`, `collection`, and `closure` as runtime-grade evidence
+- Treat `scenario`, `state-report`, and `baseline` as stronger proof than raw log presence when available
+- Treat `project scenarios`, `scenario inspect`, and `project baselines` as the preferred discovery path before inventing an ad hoc flow spec
+- Treat `actions`, `state-snapshots`, and `request-attribution` as run-scoped proof, not optional decoration
+- For Miniapp, `miniapp verify` is never a closure claim; only `miniapp run/scenario/closure` can reach `user_flow_closed`
+- Distinguish “runtime observed” from “user flow closed”; they are different evidence layers
 - Do not end with free-form narrative when a runtime report is available; prefer the evidence report
 - Do not claim “verified” or “done” if `closure` is not resolved
+- Do not claim “ship” unless the release decision says `ship`
 - If `project_only` or `runtime_unverified`, say that explicitly instead of soft-claiming success
 - Never use DevTools console UI scraping as the primary evidence chain
 - Never claim “done” without checking `closure`

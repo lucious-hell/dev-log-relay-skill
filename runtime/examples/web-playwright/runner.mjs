@@ -5,7 +5,9 @@ function parseArgs(argv) {
   const options = {
     relay: "http://127.0.0.1:5077",
     runId: "",
+    baselineRunId: "",
     mode: "baseline",
+    templateName: "request_to_ui_continuity",
   };
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -19,8 +21,18 @@ function parseArgs(argv) {
       index += 1;
       continue;
     }
+    if (token === "--baselineRunId") {
+      options.baselineRunId = argv[index + 1] || "";
+      index += 1;
+      continue;
+    }
     if (token === "--mode") {
       options.mode = argv[index + 1] || options.mode;
+      index += 1;
+      continue;
+    }
+    if (token === "--templateName") {
+      options.templateName = argv[index + 1] || options.templateName;
       index += 1;
     }
   }
@@ -202,6 +214,21 @@ async function installRelay(page, relayEndpoint, runId) {
         });
       });
 
+      window.addEventListener("DOMContentLoaded", () => {
+        const emitRender = (reason) => {
+          post("info", `render_complete:${reason}`, {
+            phase: "render",
+            tags: ["render_complete", "ui_updated", reason],
+          });
+        };
+        requestAnimationFrame(() => emitRender("dom_ready"));
+        const statusNode = document.getElementById("status");
+        if (statusNode) {
+          const observer = new MutationObserver(() => emitRender("status_changed"));
+          observer.observe(statusNode, { childList: true, subtree: true, characterData: true });
+        }
+      });
+
       post("info", `route init ${location.pathname}`, {
         phase: "navigation",
         route: location.pathname,
@@ -265,6 +292,55 @@ try {
   await endStep(options.relay, options.runId, assertStepId, passed ? "passed" : "failed");
 
   await endRun(options.relay, options.runId, shouldPass && clickOutcome.ok && passed ? "passed" : "failed");
+  const scenario = await requestJson(options.relay, "/scenarios/validate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      runId: options.runId,
+      target: "web",
+      templateName: options.templateName,
+    }),
+  });
+  const [scenarioView, stateReport, baseline, report, summary, collection, diagnosis, closure] = await Promise.all([
+    requestJson(options.relay, `/ai/run/${options.runId}/scenario`),
+    requestJson(options.relay, `/ai/run/${options.runId}/state-report`),
+    requestJson(options.relay, `/ai/run/${options.runId}/baseline`),
+    requestJson(options.relay, `/ai/run/${options.runId}/report`),
+    requestJson(options.relay, `/ai/run/${options.runId}/summary`),
+    requestJson(options.relay, `/ai/run/${options.runId}/collection`),
+    requestJson(options.relay, `/ai/run/${options.runId}/diagnosis`),
+    requestJson(options.relay, `/ai/run/${options.runId}/closure`),
+  ]);
+  const scenarioDiff = options.baselineRunId
+    ? await requestJson(options.relay, `/ai/diff/scenario?baselineRunId=${encodeURIComponent(options.baselineRunId)}&currentRunId=${encodeURIComponent(options.runId)}`)
+    : null;
+  const stateDiff = options.baselineRunId
+    ? await requestJson(options.relay, `/ai/diff/state?baselineRunId=${encodeURIComponent(options.baselineRunId)}&currentRunId=${encodeURIComponent(options.runId)}`)
+    : null;
+  process.stdout.write(
+    `${JSON.stringify(
+      {
+        ok: true,
+        runId: options.runId,
+        mode: options.mode,
+        templateName: options.templateName,
+        baselineRunId: options.baselineRunId || "",
+        scenario: scenario.scenario,
+        scenarioView: scenarioView.scenario,
+        stateReport: stateReport.stateReport,
+        baseline: baseline.baseline,
+        scenarioDiff: scenarioDiff?.changed || [],
+        stateDiff: stateDiff?.changed || [],
+        summary: summary.summary,
+        collection: collection.collection,
+        diagnosis: diagnosis.diagnosis,
+        closure: closure.closure,
+        report: report.report,
+      },
+      null,
+      2
+    )}\n`
+  );
 } finally {
   await browser.close();
   await new Promise((resolve) => server.close(resolve));
