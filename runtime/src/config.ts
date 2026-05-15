@@ -7,6 +7,7 @@ export interface RelayConfig {
   includeDebug: boolean;
   artifactDir: string;
   projectMemoryDir: string;
+  runtimeStoreDir: string;
 }
 
 function intFromEnv(name: string, fallback: number): number {
@@ -24,5 +25,6 @@ export function loadConfig(): RelayConfig {
     includeDebug: String(process.env.DEV_LOG_RELAY_INCLUDE_DEBUG || "").trim() === "1",
     artifactDir: process.env.DEV_LOG_RELAY_ARTIFACT_DIR || "artifacts",
     projectMemoryDir: process.env.DEV_LOG_RELAY_PROJECT_MEMORY_DIR || "project-memory",
+    runtimeStoreDir: process.env.DEV_LOG_RELAY_RUNTIME_STORE_DIR || "artifacts/relay-store",
   };
 }

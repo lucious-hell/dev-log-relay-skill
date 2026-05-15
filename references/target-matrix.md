@@ -17,6 +17,9 @@ Only the fourth layer is strong enough to support a default closure claim.
 - Full runtime loop: yes
 - Reference driver: Playwright
 - External drivers: Codex `computer use`, IDE browser agents, generic browser-driving agents
+- Runtime target: the invocation workspace project only; built-in demo flows are forbidden in production CLI paths
+- Harness: first-class through `relay harness verify`; gate pass requires real target resolution, blackbox visible assertion pass, valid evidence refs, and no blocking runtime failure
+- Blackbox loop: supported through Playwright or nonce-matched Computer Use ledger; pass/fail is visible UI evidence only, with persisted evidence refs, evidence capsules, action traces, Playwright trace refs, optional auth profiles, optional visual/a11y quality signals, and optional Playwright export artifacts
 - Scenario validation: yes
 - Baseline diff: yes
 - Required closure signals:
@@ -27,8 +30,11 @@ Only the fourth layer is strong enough to support a default closure claim.
 
 ### WeChat Miniapp
 
-- Status: partial
-- Full automatic driving: driver-dependent
+- Status: automated harness with guarded external boundaries
+- Full automatic driving: attempted by the built-in `devtools-automator` driver after managed DevTools profile/bootstrap/sidecar preparation; hard system/account boundaries surface as `forExecutingAI.userActionRequest`
+- External drivers: external driverModule override, or Codex `computer use` through `runtime/driver-modules/computer-use-miniapp-driver.mjs` and a target-project action ledger
+- Harness: supported through built-in driver, driverModule, or nonce-matched Computer Use ledger; missing action ledger / explicit visible evidence / runtime event returns hold/failure and cannot claim completion. Built-in DevTools automation also requires verified controlled profile isolation before automatic pass
+- Blackbox loop: supported with built-in driver, a real driver module, or nonce-matched Computer Use ledger after verify-first; `miniapp bootstrap/doctor` prepares and diagnoses the managed DevTools profile/port/project-path setup, `miniapp sidecar` manages persistent local DevTools lifecycle, while `miniapp driver check` diagnoses driver readiness. None of these diagnostic commands claims closure by itself
 - Verify-first flow: required
 - Scenario validation: observation-first
 - Baseline diff: yes, but depends on run-scoped action/state evidence quality

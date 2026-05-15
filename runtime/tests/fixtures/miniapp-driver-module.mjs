@@ -44,6 +44,15 @@ export async function executeMiniappScenario(input) {
           tags: ["setData", "state_update", "state_signature", "ready"],
           context: { hookName: "onLoad", keys: ["list", "ready"], stateSignature: "list|ready" },
         },
+        {
+          source: "miniapp",
+          level: "info",
+          message: "Visible UI: 首页 Ready 列表",
+          phase: "render",
+          route: pagePath,
+          tags: ["visible_evidence"],
+          context: { visibleEvidence: ["首页 Ready 列表"], visibleText: "首页 Ready 列表" },
+        },
       ],
     },
   ];

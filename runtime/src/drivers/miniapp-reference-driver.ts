@@ -1,6 +1,8 @@
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { MiniappActionInput, MiniappActionResult, MiniappDriverType, ScenarioSpec } from "../types.js";
+import { validateMiniappActionResults } from "../core/validation.js";
+import { executeBuiltinDevtoolsAutomator } from "./builtin-devtools-automator-driver.js";
 
 export interface ExecuteMiniappDriverInput {
   driver: MiniappDriverType;
@@ -9,6 +11,10 @@ export interface ExecuteMiniappDriverInput {
   runId: string;
   projectRoot: string;
   driverModule?: string;
+  cliPath?: string;
+  servicePort?: string;
+  projectPath?: string;
+  profileDir?: string;
 }
 
 export interface ExecuteMiniappDriverOutput {
@@ -18,7 +24,7 @@ export interface ExecuteMiniappDriverOutput {
 }
 
 interface MiniappDriverModule {
-  executeMiniappScenario?: (input: ExecuteMiniappDriverInput) => Promise<MiniappActionResult[]> | MiniappActionResult[];
+  executeMiniappScenario?: (input: ExecuteMiniappDriverInput) => Promise<MiniappActionResult[] | ExecuteMiniappDriverOutput> | MiniappActionResult[] | ExecuteMiniappDriverOutput;
 }
 
 function defaultActionsForScenario(spec: ScenarioSpec): MiniappActionInput[] {
@@ -70,6 +76,37 @@ export async function executeMiniappReferenceDriver(input: ExecuteMiniappDriverI
   const injectedModule = await loadDriverModule(input.driverModule);
   if (injectedModule?.executeMiniappScenario) {
     const results = await injectedModule.executeMiniappScenario(input);
+    if (!Array.isArray(results)) {
+      const validation = validateMiniappActionResults(results.actionResults);
+      if (!validation.ok) {
+        return {
+          status: "driver_not_available",
+          actionResults: defaultActionsForScenario(input.scenario).map((action) => ({
+            actionId: action.id,
+            type: action.type,
+            pagePath: action.pagePath,
+            success: false,
+            reason: validation.reasonCode || "driver_result_invalid",
+          })),
+          reason: validation.reasonCode || "driver_result_invalid",
+        };
+      }
+      return results;
+    }
+    const validation = validateMiniappActionResults(results);
+    if (!validation.ok) {
+      return {
+        status: "driver_not_available",
+        actionResults: defaultActionsForScenario(input.scenario).map((action) => ({
+          actionId: action.id,
+          type: action.type,
+          pagePath: action.pagePath,
+          success: false,
+          reason: validation.reasonCode || "driver_result_invalid",
+        })),
+        reason: validation.reasonCode || "driver_result_invalid",
+      };
+    }
     return {
       status: "executed",
       actionResults: results,
@@ -78,8 +115,9 @@ export async function executeMiniappReferenceDriver(input: ExecuteMiniappDriverI
   }
 
   if (input.driver === "devtools-automator") {
-    try {
-      await new Function("return import('miniprogram-automator')")();
+    const results = await executeBuiltinDevtoolsAutomator(input);
+    const validation = validateMiniappActionResults(results.actionResults);
+    if (!validation.ok && results.status === "executed") {
       return {
         status: "driver_not_available",
         actionResults: defaultActionsForScenario(input.scenario).map((action) => ({
@@ -87,23 +125,12 @@ export async function executeMiniappReferenceDriver(input: ExecuteMiniappDriverI
           type: action.type,
           pagePath: action.pagePath,
           success: false,
-          reason: "miniprogram_automator_detected_but_runtime_bridge_not_configured",
+          reason: validation.reasonCode || "driver_result_invalid",
         })),
-        reason: "devtools_driver_requires_project_specific_bridge_configuration",
-      };
-    } catch {
-      return {
-        status: "driver_not_available",
-        actionResults: defaultActionsForScenario(input.scenario).map((action) => ({
-          actionId: action.id,
-          type: action.type,
-          pagePath: action.pagePath,
-          success: false,
-          reason: "miniprogram_automator_not_installed_or_not_reachable",
-        })),
-        reason: "miniprogram_automator_unavailable",
+        reason: validation.reasonCode || "driver_result_invalid",
       };
     }
+    return results;
   }
 
   return {

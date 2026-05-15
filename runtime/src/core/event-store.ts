@@ -12,6 +12,12 @@ export class EventStore {
 
   constructor(private readonly maxSize: number) {}
 
+  hydrate(events: RelayLogEvent[]): void {
+    const sorted = events.slice().sort((left, right) => left.sequence - right.sequence);
+    this.events.splice(0, this.events.length, ...sorted.slice(-this.maxSize));
+    this.nextSequence = Math.max(1, ...sorted.map((event) => event.sequence + 1));
+  }
+
   assignSequence(): number {
     const sequence = this.nextSequence;
     this.nextSequence += 1;

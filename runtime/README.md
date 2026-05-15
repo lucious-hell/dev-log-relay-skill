@@ -64,12 +64,19 @@ npm run start
 npm run cli -- run start --label smoke --target web
 npm run cli -- ai diagnosis --runId <runId> --pretty
 npm run cli -- ai report --runId <runId> --pretty
-npm run cli -- loop web --mode baseline --pretty
+npm run cli -- harness verify --target web --url http://127.0.0.1:5173 --goal "user can complete the target flow" --pretty
+npm run cli -- harness verify --target miniapp --pretty
+npm run cli -- harness verify --target miniapp --driverModule <driver-module.mjs> --pretty
+npm run cli -- harness report --harnessRunId <harnessRunId> --pretty
+npm run cli -- harness evidence --harnessRunId <harnessRunId> --ref <artifactRef> --pretty
+npm run cli -- loop web --url http://127.0.0.1:5173 --pretty
 npm run cli -- loop compare --baselineRunId <a> --currentRunId <b> --pretty
-npm run cli -- autoloop run --target web --pretty
+npm run cli -- autoloop run --target web --url http://127.0.0.1:5173 --pretty
 npm run cli -- web verify --pretty
 npm run cli -- miniapp verify --pretty
 npm run cli -- miniapp run --template miniapp_home_entry --driver devtools-automator --pretty
+npm run cli -- miniapp run --template miniapp_home_entry --driver devtools-automator --driverModule <driver-module.mjs> --pretty
+DEV_LOG_RELAY_COMPUTER_USE_LEDGER=/abs/path/computer-use-ledger.json npm run cli -- miniapp run --template miniapp_home_entry --driver computer-use --driverModule driver-modules/computer-use-miniapp-driver.mjs --pretty
 npm run cli -- project verify --target auto --pretty
 npm run cli -- project scenarios --target miniapp --pretty
 npm run cli -- project baselines --target miniapp --pretty
@@ -92,6 +99,10 @@ npm run cli -- ai handoff --runId <runId> --pretty
 - `relay doctor trigger`
 - `relay doctor enforcement`
 - `relay doctor readiness`
+- `relay harness verify`
+- `relay harness report`
+- `relay harness evidence`
+- `relay harness benchmark`
 - `relay project identify`
 - `relay project compatibility`
 - `relay project verify`
@@ -463,55 +474,120 @@ npm run cli -- agent contract --target web --driver computer-use --pretty
 GET /ai/driver/contract?target=web&driver=computer-use
 ```
 
+## Codex Computer Use Miniapp Driver
+
+`driver-modules/computer-use-miniapp-driver.mjs` is a bridge driver module for Codex Computer Use. It does not click by itself from Node. Codex uses Computer Use to operate WeChat DevTools or the target Miniapp environment, writes the observed action ledger to `DEV_LOG_RELAY_COMPUTER_USE_LEDGER`, and then `miniapp run` imports this module to feed the real action results and evidence into the relay.
+
+Required ledger shape:
+
+```json
+{
+  "targetProjectRoot": "/abs/path/to/target-project",
+  "app": "WeChat DevTools",
+  "actions": [
+    {
+      "actionId": "enter-home",
+      "type": "enter_page",
+      "pagePath": "/pages/home/index",
+      "success": true,
+      "reason": "codex_computer_use_observed_home",
+      "emittedEvents": [
+        { "source": "miniapp", "level": "info", "message": "HomePage.onLoad", "phase": "lifecycle", "route": "/pages/home/index" }
+      ]
+    }
+  ]
+}
+```
+
+The module fails with `computer_use_ledger_required`, `computer_use_ledger_unreadable`, `computer_use_ledger_empty`, or `computer_use_ledger_target_project_mismatch` when it cannot prove the ledger belongs to the invocation target project. This keeps Computer Use as a real driver bridge, not a built-in demo or closure shortcut.
+
 ## Playwright 示例
 
 Playwright 在本仓库里的角色是：
 
-- 内建参考驱动
-- 演示闭环夹具
-- 可重复执行的测试样例
+Web 生产闭环只能指向真实目标项目。`loop web` / `autoloop run --target web` 会优先使用 `--url` 或 `DEV_LOG_RELAY_TARGET_URL`，否则尝试在 `DEV_LOG_RELAY_WORKSPACE_ROOT` 解析出的 Web 项目内启动 `dev/start/serve/preview` 脚本并发现 localhost URL。无法定位真实目标 URL 时会返回 `target_project_url_required` 或 `target_project_start_failed`，不会回退到内置 demo。
 
-它的作用是证明这条闭环链能稳定跑通，不是要求所有 AI agent 都必须用它。
+内置 Web demo 资产只允许作为测试夹具保留，不属于 skill-facing 命令路径。旧的 `loop web --mode baseline|broken|fixed` 会返回 `demo_runner_forbidden`。
 
-- `runtime/examples/web-playwright/runner.mjs`
+## Blackbox Scenario Loop
 
-这个示例现在会在单次 run 内自动补齐：
+黑盒测试用于回答“真实用户是否能在目标项目 UI 上完成或观察到目标流程”。它不读取组件内部状态、不调用业务内部 API、不 mock 结果，也不把 console/network/render 事件当作通过依据。
 
-- route / network / render 证据
-- `request_to_ui_continuity` 场景验证
-- baseline 快照生成
-- 与 baseline 的 scenario / state diff
-- 最终 `report` 拉取
-
-所以它不只是“打日志”，而是完整演示四层证据链如何收口到 closure 结论。
-
-手动运行：
-
-1. 启动 relay 服务
-2. 执行：
+CLI:
 
 ```bash
-npm run cli -- loop web --mode baseline --pretty
-npm run cli -- loop web --mode broken --baselineRunId <baselineRunId> --pretty
-npm run cli -- loop web --mode fixed --baselineRunId <baselineRunId> --pretty
-npm run cli -- loop compare --baselineRunId <baselineRunId> --currentRunId <currentRunId> --pretty
-npm run cli -- autoloop run --target web --artifact artifacts/autoloop-demo.json --pretty
+relay harness verify --target web --url http://127.0.0.1:5173 --goal "用户搜索商品" --pretty
+relay harness verify --target miniapp --driverModule ./driver.mjs --pretty
+relay harness report --harnessRunId <harnessRunId> --pretty
+relay harness evidence --harnessRunId <harnessRunId> --ref <artifactRef> --pretty
+relay harness benchmark --fixture all --pretty
+relay blackbox discover --target web --url http://127.0.0.1:5173 --pretty
+relay blackbox plan --target web --url http://127.0.0.1:5173 --goal "用户搜索商品" --pretty
+relay blackbox run --target web --url http://127.0.0.1:5173 --driver playwright --pretty
+relay blackbox run --target web --driver computer-use --ledger ./blackbox-ledger.json --pretty
+relay blackbox report --runId <runId> --pretty
+relay blackbox capsule --runId <runId> --pretty
+relay blackbox trace --runId <runId> --format summary --pretty
+relay blackbox trace --runId <runId> --format playwright --pretty
+relay blackbox export --runId <runId> --format playwright --pretty
+relay blackbox seed-regression --runId <runId> --pretty
+relay benchmark blackbox --fixture all --pretty
+relay miniapp driver check --pretty
+relay store inspect --runId <runId> --pretty
+relay store inspect --harnessRunId <harnessRunId> --pretty
+relay store cleanup --olderThanDays 30 --dryRun --pretty
+relay store cleanup --olderThanDays 30 --confirm --pretty
 ```
 
-示例模式：
+API:
 
-- `baseline`: 正常流程
-- `broken`: 故意触发网络与 UI 错误
-- `fixed`: 修复后流程
+- `POST /ai/harness/from-blackbox-run`
+- `POST /ai/harness/verify`（兼容别名；server 端用于已存 blackbox run 的 harness finalization，本地 driver 编排请使用 `relay harness verify`）
+- `GET /ai/harness/:harnessRunId/report`
+- `GET /ai/harness/:harnessRunId/evidence?ref=<artifactRef>`
+- `POST /ai/blackbox/discover`
+- `POST /ai/blackbox/plan`
+- `GET /ai/blackbox/plan/:planId`
+- `POST /blackbox/run`
+- `GET /ai/run/:runId/blackbox-report`
+- `GET /ai/run/:runId/evidence-refs`
+- `GET /ai/run/:runId/evidence-capsule`
+- `GET /ai/run/:runId/evidence-artifact?ref=<artifactRef>`
+- `GET /ai/run/:runId/blackbox-trace`
+- `POST /ai/run/:runId/blackbox-export`
+- `POST /ai/run/:runId/seed-regression`
+- `POST /ai/benchmark/blackbox`
+- `GET /ai/store/inspect?runId=<runId>`
+- `GET /ai/store/inspect?harnessRunId=<harnessRunId>`
+- `POST /ai/store/cleanup`
 
-生成的 `artifacts/autoloop-demo.json` 会包含 broken -> fixed 的完整证据链。
+`relay harness verify` 是执行 AI 的默认完工验证入口。它编排真实目标解析、Web 启动/URL 附着、Miniapp bootstrap/verify/driver check、黑盒 plan/run、evidence capsule/trace、失败回归沉淀和 release gate。Server API 的 `/ai/harness/from-blackbox-run` 负责把已经存储的 blackbox report 收口成 harness report；它不会在 server 内替本地执行 AI 点击浏览器或启动目标项目。Harness 报告包含 `HarnessGate`、`harnessRunId`、`evidenceIndexRef`、`artifactManifestRef`、`regressionSeedRef` 和短 `forExecutingAI`；只有 `HarnessGate.status === "pass"` 才能被解释为目标项目验证通过。`harness evidence` 只能读取 harness evidence index 和 artifact manifest 中登记的 ref，不能任意读 runtime store 文件。
+
+Web 默认由 Playwright 访问真实目标 URL，先 discover 可见 UI observe inventory，再采集 `visible_evidence` / `blackbox_assertion`、screenshot 和 accessibility evidence refs。Observe inventory 包含 action candidates、locator candidates、mutation risk flags 和 coverage hints；生成 case 时优先使用 `data-testid`、ARIA role/name、label/placeholder、文本，最后才使用 CSS/nth fallback。若当前环境无法启动 Playwright，`blackbox discover` 会退到真实目标 URL 的轻量 HTML inventory，而不会改用 demo。
+
+每个 Web Playwright blackbox case 会同时写入 Dev Log Relay action trace artifact 和 Playwright trace zip ref，记录 locator、URL before/after、可见文本 before/after、断言结果、截图和 accessibility refs。Trace 只用于审计和诊断，不替代 visible assertion。`blackbox capsule` 返回短摘要、失败分类和关键 refs；`evidence-artifact` 只能读取 runtime store 内的 ref，路径穿越会返回 `evidence_artifact_ref_invalid`。`blackbox export` 默认把通过的 Web case 导出为 Playwright spec artifact；只有显式 `--out <path>` 才写到用户指定位置。失败 case 不会被伪装成可执行成功测试；locator repair 后通过的 case 只能是 `manual_review_required`，release gate 仍保持 hold。
+
+登录态项目可通过 `--storageState <path>` 或 `DEV_LOG_RELAY_WEB_STORAGE_STATE` 提供 Playwright storage state。`--saveAuthProfile <name>` 会把 storage state 存进 runtime store，`--authProfile <name>` / `DEV_LOG_RELAY_AUTH_PROFILE` 可复用；profile 绑定 `targetProject.workspaceRoot + targetUrl origin`，不匹配会返回 `auth_profile_target_mismatch`。`--visual` 会记录截图尺寸、可见元素与空白屏信号；`--a11y` 会记录 accessibility 摘要并标记无可访问名称的关键控件；`--viewport desktop|mobile|both` 控制采集视口。
+
+`blackbox seed-regression` 会从失败 case、runtime failure、locator repair candidate 生成 regression candidate artifact，供后续回归资产化。`benchmark blackbox` 只跑 `runtime/fixtures/targets/` 下的真实 fixture target，用于衡量 discover/run/report 能力，不触达生产 demo runner。
+
+Computer Use 不在 Node 内自动点击；它只通过真实 target-project ledger 回灌。Ledger 必须匹配 `planId`、`planNonce`、`caseNonce`、target project、target URL，并包含 `visibleEvidence` 与 `actionLedger`。Miniapp 仍然必须 verify-first；`devtools-automator` 默认使用内置 `miniprogram-automator` driver，并可被真实 `--driverModule` 覆盖；`computer-use` 需要 ledger，没有真实 action ledger 时不得进入闭环。
+
+`relay harness verify --target miniapp` 默认启用 auto-prepare：创建 Dev Log Relay 专用微信开发者工具 profile、检查/启动 sidecar、固定服务端口、解析内置或外部 driver，并执行可见 UI 黑盒动作。`relay miniapp bootstrap --fix --pretty` 会创建专用 profile，默认写入 runtime artifact home，也可用 `DEV_LOG_RELAY_HOME` 指定全局持久目录，并写入固定服务端口配置，默认端口 `9420`。`relay miniapp doctor --fix --pretty` 会同时执行 bootstrap 与 driver resolver，用于首次配对或环境修复。`relay miniapp driver check --pretty` 用来收敛 Miniapp driver 接入失败原因，包括内置 driver、`driverModule`、`DEV_LOG_RELAY_MINIAPP_DRIVER_MODULE`、微信开发者工具 CLI、服务端口、`miniprogram-automator` 版本、launch/connect 模式、profile isolation 和真实 projectPath。它只是 resolver/诊断入口，不绕过 action ledger、visible evidence 和 runtime event 要求。内置 driver 的 HarnessGate 还会检查 profile isolation；未验证受控 profile 时不得自动 pass。
+
+`relay miniapp sidecar install --start --pretty` 会生成用户级 LaunchAgent 并启动本地 Miniapp sidecar。sidecar 暴露 `127.0.0.1:5078/health`，用于检查受控 profile、服务端口、DevTools CLI 和项目路径，并可通过受控 HOME 拉起微信开发者工具。`relay miniapp bootstrap --driver computer-use --pretty` 会输出 Codex Computer Use 配对计划和 ledger 模板，供执行 AI 在已有 Computer Use 权限时完成首次 UI 配对。sidecar 和 Computer Use pairing 都只属于环境准备层，不进入 release gate，也不能替代 visible blackbox assertion、内置/外部 driver action result 或 Computer Use action ledger。普通 screenshot captured 文案只作为诊断，不计入 visible evidence。无法自动完成的系统/账号边界会统一进入 `forExecutingAI.userActionRequest`，执行 AI 只应转述其中的最少用户步骤并在完成后重试 `retryCommand`。
+
+`DEV_LOG_RELAY_RUNTIME_STORE_DIR` 可覆盖运行时证据存储目录，默认在 artifact 目录下的 `relay-store/`。每个 run / harness run 会写入 `artifact-manifest.json`，登记证据 ref、类型、大小、hash、创建时间和 owner。`relay store inspect` 用于审计这些 refs；`relay store cleanup` 默认只做 dry-run，只有显式 `--confirm` 才会删除 runtime store 内的过期 artifact。`forExecutingAI` 会汇总已验证用户目标、失败 case、用户实际看到的内容、trace refs、export ref、coverage gaps、failure taxonomy、runtime 诊断线索和下一步建议。Release decision 不能只因 trace/export 完整或 runtime 事件充足而 ship；必须至少有阻塞黑盒 case 通过，且没有阻塞 runtime failure。
 
 ## AI 使用准则
 
 - 改了运行时代码后，必须先经过 target / trigger gate
-- Web 命中测试、复测、报错、回归场景后，必须先跑 `relay project verify --target web`，再进入 `relay autoloop run`
-- Miniapp 命中同类场景后，必须先跑 `relay project verify --target miniapp`
+- Web 命中测试、复测、报错、回归场景后，默认跑 `relay harness verify --target web`，必要时再用 `project verify` / `autoloop run` 做低层诊断
+- 需要站在真实用户视角验证时，优先使用 `relay harness verify`；只有调试或补证据时才下钻到 `relay blackbox plan/run/report`
+- Miniapp 命中同类场景后，必须先经过 `relay harness verify --target miniapp`；默认会自动执行 bootstrap、sidecar check/start、内置 driver resolution 和黑盒动作。低层诊断才单独跑 `relay miniapp bootstrap --fix`、`relay miniapp doctor --fix` 或 `relay project verify --target miniapp`
 - Web 未通过 `project verify` 或 readiness 不足时，不应进入完整 autoloop
+- Miniapp `run` 默认使用内置 `devtools-automator` driver；真实 `--driverModule` 或 `DEV_LOG_RELAY_MINIAPP_DRIVER_MODULE` 可覆盖内置 driver；`external-agent` 只用于 contract 查看
+- Codex Computer Use 驱动 Miniapp 时，使用 `--driver computer-use --driverModule driver-modules/computer-use-miniapp-driver.mjs` 并提供 `DEV_LOG_RELAY_COMPUTER_USE_LEDGER`
 - 若只是文档、纯重命名、无运行时影响改动，不需要触发 autoloop
 - 若 `collection.status=incomplete` 或 `integrity` 明显不足，先补采集再修业务
 - `timeline` 只能说明顺序，不能单独说明“修好了”

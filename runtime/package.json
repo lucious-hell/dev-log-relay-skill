@@ -19,6 +19,7 @@
   "dependencies": {
     "fastify": "^5.0.0",
     "fastify-plugin": "^5.0.0",
+    "miniprogram-automator": "^0.12.1",
     "playwright": "^1.52.0"
   },
   "devDependencies": {

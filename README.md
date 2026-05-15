@@ -1,489 +1,567 @@
 # Dev Log Relay Skill
 
-[中文](#中文) | [English](#english)
+[English](#english) | [中文](#中文)
 
-Dev Log Relay is a skill-oriented local middleware for AI-assisted development on browser Web projects and WeChat Miniapp projects.
+## English
 
-It does not try to be a universal agent for every stack. Its job is narrower and more useful: help an AI actively trigger runtime verification, collect structured evidence, diagnose failures, decide closure, and produce handoff artifacts when closure is not justified.
+Dev Log Relay is a target-project verification harness for executing AI.
 
-## Highlights
+It helps an AI prove work against the real project before claiming completion: resolve the target workspace, start or attach to the real environment, run user-visible blackbox flows, collect auditable evidence, seed regressions when blocked, and return a release gate.
 
-- Skill-first: natural-language trigger rules live in `SKILL.md`
-- Runtime-first: project inspection is not treated as runtime proof
-- Evidence-first: runtime work should end with a structured report, not a vague summary
-- Four-layer evidence ladder: `project_structure -> instrumentation_attached -> runtime_events_observed -> user_flow_closed`
-- Scenario-first validation: validate user flows and state transitions, not just raw log presence
-- Regression baselines: compare scenario, request, state, and signal changes across runs
-- Web closed loop: strong support for browser Web flows
-- Miniapp executable closure: verify-first for readiness, then `run -> scenario -> closure` for run-scoped closure evidence
-- Driver-agnostic: Playwright is a reference driver, but external IDE/browser agents can drive the target too
-- Project resolution: monorepo, Next app/pages router, Miniapp `miniprogramRoot`, subpackages, and source/upload layout are inspected through one resolution report
-- Release decision: runtime closure now collapses into `ship | hold | manual_review_required`
-- CI-friendly: readiness, scenario-smoke, closure, and report modes return stable JSON and exit codes
+It is not a demo runner, a generic test framework, or an AI judge. Its job is narrower: prevent self-certified "done" by forcing completion claims through real runtime evidence.
 
-## Repository Layout
+### Why It Exists
+
+AI coding agents can describe a fix confidently while never exercising the product as a user. Dev Log Relay adds an external verification layer between "I changed the code" and "the target project works."
+
+The default proof path is:
+
+```text
+target project -> real environment -> blackbox user flow -> evidence store -> release gate
+```
+
+Only `HarnessGate.status === "pass"` should be treated as target-project verification passed.
+
+### Supported Targets
+
+- Browser Web projects
+- WeChat Miniapp projects
+
+Unsupported by design:
+
+- Electron
+- React Native
+- Native iOS / Android
+- Desktop GUI apps
+- Server batch jobs
+- Documentation-only or mechanical-only edits
+
+### Core Guarantees
+
+- Real target project only: production commands must use the invocation workspace, an explicit URL, or the target project's own start command.
+- No production demo fallback: built-in demos and fixtures are test/benchmark assets only.
+- User-visible blackbox assertions: pass/fail is based on visible UI evidence, not internal APIs, mocks, component state, or logs alone.
+- Auditable evidence: reports, traces, screenshots, accessibility summaries, capsules, manifests, and exports are stored in the runtime artifact store.
+- Unified release gate: traces, screenshots, runtime logs, visual/a11y signals, and locator repair can help diagnosis, but cannot independently ship.
+- Miniapp requires a real driver: use a driver module or a valid Computer Use ledger; verify-only observations do not prove user-flow closure.
+
+### Repository Layout
 
 ```text
 dev-log-relay-skill/
 ├── SKILL.md                # natural-language skill contract
-├── LICENSE                 # open-source license
+├── LICENSE                 # MIT license
 ├── agents/                 # skill metadata
 ├── references/             # workflow, target matrix, driver contract
-├── scripts/                # wrapper entrypoints for skill execution
-└── runtime/                # HTTP service, CLI, adapters, tests, examples
+├── scripts/                # skill-facing wrapper entrypoints
+└── runtime/                # HTTP service, CLI, adapters, fixtures, tests
 ```
 
-## What This Project Is For
+### Skill Installation
 
-Use this project when an AI is working on:
+For end users, Dev Log Relay should be invisible. They should not start a server, run npm commands, or call the CLI directly. They ask the executing AI to test, retest, or verify closure; the AI triggers this skill and runs the harness.
 
-- browser Web projects
-- WeChat Miniapp projects
-
-Typical trigger requests include:
-
-- "test this flow"
-- "retest the fix"
-- "run a regression check"
-- "verify the closure"
-- "measure whether the page still has runtime issues"
-
-Chinese trigger examples:
-
-- “测一下这个 Web 流程”
-- “跑一下这个页面看看有没有报错”
-- “自测一下刚改的功能”
-- “复测一下这个 bug”
-- “回归验证一下”
-- “看看这个小程序还有没有问题”
-- “排查一下为什么白屏”
-- “修完之后再验证一轮”
-- “确认这轮是不是已经闭环了”
-
-## What This Project Is Not For
-
-This skill is intentionally scoped. It is not a universal runtime framework for:
-
-- Electron
-- React Native
-- native iOS / Android
-- desktop GUI apps
-- server batch jobs
-- non-browser graphics apps
-- documentation-only or purely mechanical refactors
-
-## Default Skill Behavior
-
-When runtime work is detected, the skill should not jump straight to "done".
-
-The expected sequence is:
-
-1. detect target suitability
-2. verify project integration readiness
-3. start or inspect a run
-4. bind relay to the current run / step
-5. collect runtime evidence
-6. query diagnosis
-7. query closure
-8. produce handoff when unresolved or blocked
-
-The default evidence-first report order is:
-
-1. `target / support`
-2. `trigger decision`
-3. `project verify`
-4. `runtime readiness`
-5. `collection`
-6. `diagnosis`
-7. `closure`
-8. `handoff`
-
-The runtime evidence itself is now separated into four layers:
-
-1. `project_structure`
-2. `instrumentation_attached`
-3. `runtime_events_observed`
-4. `user_flow_closed`
-
-That separation is intentional. “能接入” and “流程已闭环” are not the same thing.
-
-## Main Entrypoints
-
-The skill prefers the wrapper scripts in `scripts/` so the user or agent does not need to remember internal runtime details.
-
-- `scripts/start-relay.sh`
-- `scripts/doctor.sh`
-- `scripts/project-verify.sh`
-- `scripts/miniapp-verify.sh`
-- `scripts/miniapp-run.sh`
-- `scripts/miniapp-scenario.sh`
-- `scripts/miniapp-closure.sh`
-- `scripts/agent-contract.sh`
-- `scripts/web-autoloop.sh`
-- `scripts/handoff.sh`
-
-These wrappers auto-start the local relay backend when needed.
-
-## Runtime Boundary
-
-The project keeps a strict distinction between project inspection and runtime proof:
-
-- `project verify`: "Is the project structurally ready to be instrumented?"
-- `web verify` without `runId`: "What can we infer from project inspection only?"
-- `web verify --runId <runId>` or `/ai/run/:runId/readiness`: "What runtime signals were actually observed?"
-- `miniapp verify`: "Is the Miniapp structure and attachment ready for runtime closure?"
-- `miniapp run/scenario/closure`: "Did a real Miniapp action chain produce closure-grade evidence and a release decision?"
-
-That boundary is deliberate. Project structure helps preparation; it does not prove runtime closure.
-
-It also keeps a strict distinction between:
-
-- target detection
-- project compatibility
-- runtime observation
-- scenario closure
-
-If the skill only reaches the first or second layer, it must not claim that the user flow is closed.
-
-## Validation Model
-
-The runtime engine is no longer only run-centered. It is also:
-
-- `scenario-centered`: declare expected user flow and state transitions
-- `baseline-aware`: compare current run with known-good signals
-- `failure-chain-oriented`: link UI breakage back to request, route, lifecycle, render, or data-consumption stages
-
-Typical validation additions now include:
-
-- `request_to_ui_continuity`
-- `cache_then_revalidate`
-- `stale_fallback_on_error`
-- `loading_empty_error_exclusive`
-- `miniapp_request_to_setData_continuity`
-
-These templates are exposed through the runtime CLI and APIs rather than a dashboard.
-
-The built-in Web example now runs this chain end to end: it emits route, network, and render evidence, validates a scenario, captures a baseline snapshot, and compares later runs back to that baseline before closure is claimed.
-
-Miniapp verification also handles more realistic project layouts than a fixed template path. It can now read `project.config.json`, honor `miniprogramRoot`, and follow subpackage page declarations so verify-first is closer to real projects.
-
-Miniapp closure is now a dedicated chain instead of a verify-only placeholder:
-
-- `relay miniapp verify`
-- `relay miniapp run`
-- `relay miniapp scenario`
-- `relay miniapp closure`
-
-That chain uses Miniapp-specific evidence such as action boundaries, route stack continuity, lifecycle continuity, request attribution, and `setData` / state signatures. `miniapp verify` alone is not a closure result.
-
-Project-local scenarios can also be loaded from:
+For skill integrators, installation should be one action in the host agent environment:
 
 ```text
-tooling/scenarios/*.json
+Install this repository as an agent skill.
 ```
 
-Project-local baseline snapshots can also be loaded from:
+The skill contract is [SKILL.md](./SKILL.md), and the OpenAI skill metadata is [agents/openai.yaml](./agents/openai.yaml). Once installed, the executing AI should use the wrapper scripts automatically.
+
+Typical user request:
 
 ```text
-tooling/baselines/*.json
+Please test this flow and verify whether it is really complete.
 ```
 
-That means a target project can gradually accumulate its own reusable flow assets instead of relying only on built-in templates.
+Expected AI behavior:
 
-## Quick Start
+```text
+detect target -> run harness verify -> read HarnessGate -> report evidence
+```
 
-### 1. Start the runtime backend
+The primary wrapper is:
+
+```bash
+./scripts/harness-verify.sh \
+  --target web \
+  --url http://127.0.0.1:5173 \
+  --goal "user can open the catalog" \
+  --pretty
+```
+
+Report and evidence wrappers:
+
+```bash
+./scripts/harness-report.sh --harnessRunId <harnessRunId> --pretty
+./scripts/harness-evidence.sh --harnessRunId <harnessRunId> --ref <artifactRef> --pretty
+```
+
+Manual runtime setup is only for maintainers and contributors; see [Development](#development).
+
+### Web Verification
+
+Web verification can use:
+
+- `--url <targetUrl>`
+- `DEV_LOG_RELAY_TARGET_URL`
+- auto-start from the resolved target project package script
+
+Typical command:
+
+```bash
+./scripts/harness-verify.sh \
+  --target web \
+  --url http://127.0.0.1:5173 \
+  --goal "user can search products" \
+  --visual \
+  --a11y \
+  --pretty
+```
+
+Authenticated targets can use Playwright storage state:
+
+```bash
+./scripts/harness-verify.sh \
+  --target web \
+  --url http://127.0.0.1:5173 \
+  --storageState /abs/path/storage-state.json \
+  --pretty
+```
+
+### Miniapp Verification
+
+Miniapp completion proof requires real executable evidence. The default harness path now tries to prepare the managed WeChat DevTools profile, start/check the sidecar, connect the built-in `devtools-automator` driver, and run visible blackbox actions before asking for user help.
+
+Default Miniapp harness path:
+
+```bash
+./scripts/harness-verify.sh \
+  --target miniapp \
+  --pretty
+```
+
+External driver module override:
+
+```bash
+./scripts/harness-verify.sh \
+  --target miniapp \
+  --driverModule /abs/path/driver.mjs \
+  --pretty
+```
+
+Computer Use ledger bridge:
+
+```bash
+./scripts/harness-verify.sh \
+  --target miniapp \
+  --driver computer-use \
+  --ledger /abs/path/computer-use-ledger.json \
+  --pretty
+```
+
+Diagnose Miniapp driver setup:
+
+```bash
+./scripts/miniapp-doctor.sh --fix
+```
+
+Miniapp verification uses a Dev Log Relay managed WeChat DevTools profile by default. The bootstrap step writes the fixed service-port settings under the runtime artifact home, or under `DEV_LOG_RELAY_HOME` when configured; it does not rely on the user's daily DevTools window as closure evidence.
+
+For persistent local lifecycle management, the executing AI can install the optional sidecar:
+
+```bash
+./scripts/miniapp-sidecar.sh install --start
+```
+
+For one-time UI pairing through Codex Computer Use, the executing AI can request a pairing contract:
+
+```bash
+./scripts/miniapp-bootstrap.sh --fix --driver computer-use
+```
+
+If automation reaches a hard system or account boundary, the report returns `forExecutingAI.userActionRequest` with the smallest user action, the reason code, and a replayable retry command. The sidecar, bootstrap, and Computer Use pairing only prepare the environment. Generic screenshot-captured messages are diagnostic only and do not count as visible proof. Miniapp release still requires real action ledger evidence, explicit visible UI evidence, emitted runtime events, verified/controlled profile isolation for the built-in driver, and a passing HarnessGate.
+
+### Blackbox and Evidence Tools
+
+Lower-level tools are available when you need to inspect, debug, or export the harness evidence chain:
 
 ```bash
 cd runtime
-npm install
-npm run build
-npm run start
+npm run cli -- blackbox discover --target web --url http://127.0.0.1:5173 --pretty
+npm run cli -- blackbox plan --target web --url http://127.0.0.1:5173 --goal "user can search" --pretty
+npm run cli -- blackbox run --target web --url http://127.0.0.1:5173 --driver playwright --pretty
+npm run cli -- blackbox report --runId <runId> --pretty
+npm run cli -- blackbox capsule --runId <runId> --pretty
+npm run cli -- blackbox trace --runId <runId> --format summary --pretty
+npm run cli -- blackbox export --runId <runId> --format playwright --pretty
+npm run cli -- store inspect --harnessRunId <harnessRunId> --pretty
 ```
 
-Default relay address:
+Exports are written to the runtime artifact store by default. They are written into a target project only when `--out <path>` is explicitly provided.
 
-```text
-http://127.0.0.1:5077
-```
+### Runtime Store
 
-### 2. Run skill-facing commands
+The runtime store persists:
 
-Examples:
+- runs and steps
+- events
+- scenario reports
+- blackbox plans and reports
+- evidence capsules
+- action traces and Playwright traces
+- screenshot and accessibility artifacts
+- harness evidence indexes
+- artifact manifests
+
+Override the store directory:
 
 ```bash
-./scripts/doctor.sh target --target web --pretty
-./scripts/project-verify.sh --target web --pretty
-./scripts/web-autoloop.sh --target web --pretty
-./scripts/miniapp-verify.sh --pretty
-./scripts/miniapp-run.sh --templateName miniapp_home_entry --pretty
-./scripts/miniapp-scenario.sh --runId <runId> --templateName miniapp_home_entry --pretty
-./scripts/miniapp-closure.sh --runId <runId> --pretty
-cd runtime && npm run cli -- scenario list --pretty
-cd runtime && npm run cli -- scenario inspect --templateName miniapp_home_entry --pretty
-cd runtime && npm run cli -- project scenarios --pretty
-cd runtime && npm run cli -- project baselines --pretty
-cd runtime && npm run cli -- ai release-decision --runId <runId> --pretty
-cd runtime && npm run cli -- ci closure --runId <runId> --pretty
-cd runtime && npm run cli -- ci regression --runId <runId> --baselineRunId <baselineRunId> --pretty
+export DEV_LOG_RELAY_RUNTIME_STORE_DIR=/abs/path/relay-store
 ```
 
-### 3. Read the runtime docs
+Inspect or clean up artifacts:
 
-For APIs, CLI commands, adapters, artifacts, and examples, see [runtime/README.md](./runtime/README.md).
+```bash
+cd runtime
+npm run cli -- store inspect --runId <runId> --pretty
+npm run cli -- store inspect --harnessRunId <harnessRunId> --pretty
+npm run cli -- store cleanup --olderThanDays 30 --dryRun --pretty
+npm run cli -- store cleanup --olderThanDays 30 --confirm --pretty
+```
 
-## Best Practice
+Cleanup is dry-run by default and deletes only runtime-store artifacts after explicit `--confirm`.
 
-- Prefer runtime relay instrumentation over scraping browser DevTools console UI
-- Treat Web and Miniapp as separate supported surfaces with different closure rules
-- Do not claim closure from project-only evidence
-- Do not enter structural repair before `collection` / `integrity` is acceptable
-- For Miniapp, verify-first is mandatory, but closure requires `miniapp run -> miniapp scenario -> miniapp closure`
+### Development
 
-## Open Source License
+Build:
+
+```bash
+cd runtime
+npm run build
+```
+
+Run tests:
+
+```bash
+cd runtime
+npm test -- --runInBand
+```
+
+Check whitespace:
+
+```bash
+git diff --check
+```
+
+Benchmark fixtures:
+
+```bash
+cd runtime
+npm run cli -- harness benchmark --fixture all --pretty
+```
+
+### Documentation
+
+- [Runtime README](./runtime/README.md): detailed CLI, API, adapters, artifacts, and fixtures
+- [Skill contract](./SKILL.md): natural-language behavior for skill execution
+- [Workflow](./references/workflow.md): recommended verification workflow
+- [Target matrix](./references/target-matrix.md): supported and unsupported targets
+- [Driver contract](./references/driver-contract.md): external driver and ledger expectations
+
+### Contributing
+
+Contributions are welcome when they preserve the project boundary:
+
+- Keep production paths target-project-only.
+- Do not add demo fallback to normal CLI, wrapper, or skill paths.
+- Keep release decisions tied to visible blackbox assertions and valid evidence refs.
+- Add tests for new reason codes, gate behavior, driver behavior, and artifact access.
+- Prefer local-first adapters over cloud or LLM-only dependencies.
+
+### License
 
 This project is released under the MIT License. See [LICENSE](./LICENSE).
 
 ## 中文
 
-Dev Log Relay 是一个面向 AI 开发协作场景的本地 skill 中间件，专门服务于：
+Dev Log Relay 是一个面向执行 AI 的目标项目验证 harness。
 
-- 浏览器前端 Web 项目
-- 微信小程序项目
+它帮助 AI 在声称“完成”之前，先对真实目标项目完成外部验证：解析调用目录里的目标项目，启动或连接真实环境，执行用户视角黑盒流程，采集可审计证据，失败时沉淀回归候选，最后由统一 release gate 判断是否允许交付。
 
-它不追求“所有项目通吃”，而是把一件事做深：让 AI 在开发、测试、复测、回归验证和闭环确认时，能够主动拉起技能、收集运行时证据、看清日志顺序、定位故障链，并在无法闭环时留下稳定的交接工件。
+它不是 demo 跑通器，不是通用测试框架，也不是 AI judge。它的边界更窄但更关键：防止执行 AI 只靠自述就宣称完成。
 
-### 项目定位
+### 为什么需要它
 
-这个项目强调四件事：
+AI 编码代理可能很自信地描述修复结果，但没有真正站在用户视角运行产品。Dev Log Relay 在“我改完了”和“目标项目真的可用”之间增加一层外部验证。
 
-- `skill-first`：自然语言触发规则写进 `SKILL.md`
-- `runtime-first`：运行时证据优先，结构检查不是运行完成证明
-- `evidence-first`：最终汇报优先输出结构化证据，而不是泛泛总结
-- `boundary-first`：只服务 Web 和微信小程序，明确拒绝不适用目标
-
-### 仓库结构
+默认验证链路是：
 
 ```text
-dev-log-relay-skill/
-├── SKILL.md                # 自然语言技能契约
-├── LICENSE                 # 开源协议
-├── agents/                 # 技能元信息
-├── references/             # 工作流、目标矩阵、驱动契约
-├── scripts/                # skill 对外执行入口
-└── runtime/                # HTTP 服务、CLI、适配器、测试、示例
+目标项目 -> 真实环境 -> 黑盒用户流 -> 证据存储 -> release gate
 ```
 
-### 适用场景
+只有 `HarnessGate.status === "pass"` 才能被解释为目标项目验证通过。
 
-适用于 AI 正在处理以下任务时：
+### 支持目标
 
-- 修改了 Web 页面或前端运行时代码
-- 修改了微信小程序页面、生命周期、路由、请求逻辑
-- 用户要求“测一下 / 跑一下 / 自测 / 复测 / 回归验证 / 看看还有没有问题”
-- 需要判断这轮修复是否真的闭环
+- 浏览器 Web 项目
+- 微信小程序项目
 
-典型中文触发语句包括：
-
-- “测一下这个 Web 流程”
-- “跑一下这个页面看看有没有报错”
-- “自测一下刚改的功能”
-- “复测一下这个 bug”
-- “回归验证一下”
-- “看看这个小程序还有没有问题”
-- “排查一下为什么白屏”
-- “修完之后再验证一轮”
-- “确认这轮是不是已经闭环了”
-
-### 不适用场景
-
-本项目明确不把自己包装成全能方案。以下目标默认不适用：
+明确不支持：
 
 - Electron
 - React Native
 - 原生 iOS / Android
 - 桌面 GUI
 - 服务端批处理
-- 非浏览器图形应用
-- 纯文档修改或纯机械重命名
+- 纯文档修改或机械重命名
 
-### 技能默认流程
+### 核心保证
 
-命中运行时任务后，默认不能直接宣称“已经修好”。
+- 只验证真实目标项目：生产命令必须指向调用目录、显式 URL，或目标项目自己的启动命令。
+- 禁止生产 demo 回退：内置 demo 和 fixture 只用于测试和 benchmark。
+- 黑盒断言基于用户可见 UI：通过与失败不能依赖内部 API、mock、组件内部状态或日志本身。
+- 证据可审计：报告、trace、截图、accessibility 摘要、capsule、manifest、export 都写入 runtime artifact store。
+- release gate 统一收口：trace、截图、runtime log、视觉/a11y 信号和 locator repair 只能辅助诊断，不能单独放行。
+- Miniapp 必须有真实 driver：需要 driver module 或合法 Computer Use ledger；仅 verify 或 route/lifecycle observation 不能证明用户流闭环。
 
-推荐执行顺序：
+### 仓库结构
 
-1. 识别目标是否适用
-2. 验证项目接入准备度
-3. 启动或检查一轮 run
-4. 绑定当前 `runId / stepId`
-5. 收集运行时证据
-6. 拉取 diagnosis
-7. 拉取 closure
-8. 如无法闭环，则产出 handoff
+```text
+dev-log-relay-skill/
+├── SKILL.md                # 自然语言 skill 契约
+├── LICENSE                 # MIT 协议
+├── agents/                 # skill 元信息
+├── references/             # workflow、target matrix、driver contract
+├── scripts/                # 面向 skill 调用的包装入口
+└── runtime/                # HTTP 服务、CLI、适配器、fixture、测试
+```
 
-如果目标是微信小程序，默认闭环顺序应明确为：
+### Skill 安装
 
-1. `miniapp verify`
-2. `miniapp run`
-3. `miniapp scenario`
-4. `miniapp closure`
-5. 必要时 `handoff`
+对最终用户来说，Dev Log Relay 应该是不可感知的。用户不需要启动服务、不需要运行 npm 命令、也不需要直接调用 CLI。用户只需要要求执行 AI 测试、复测或验证闭环；执行 AI 自动触发这个 skill 并运行 harness。
 
-这里只把 `miniapp verify` 视为“接入与准备度检查”，不视为“流程已闭环”。
+对 skill 集成者来说，安装应该是宿主 agent 环境里的一步操作：
 
-默认证据汇报顺序：
+```text
+将本仓库安装为 agent skill。
+```
 
-1. `target / support`
-2. `trigger decision`
-3. `project verify`
-4. `runtime readiness`
-5. `collection`
-6. `diagnosis`
-7. `closure`
-8. `handoff`
+Skill 契约是 [SKILL.md](./SKILL.md)，OpenAI skill 元信息是 [agents/openai.yaml](./agents/openai.yaml)。安装完成后，执行 AI 应自动使用 wrapper 脚本。
 
-### Skill 执行入口
+典型用户请求：
 
-为了让 skill 更自然地工作，默认优先使用 `scripts/` 目录下的包装入口，而不是让用户记复杂命令：
+```text
+请测试这个流程，确认是否真的闭环。
+```
 
-- `scripts/start-relay.sh`
-- `scripts/doctor.sh`
-- `scripts/project-verify.sh`
-- `scripts/miniapp-verify.sh`
-- `scripts/miniapp-run.sh`
-- `scripts/miniapp-scenario.sh`
-- `scripts/miniapp-closure.sh`
-- `scripts/agent-contract.sh`
-- `scripts/web-autoloop.sh`
-- `scripts/handoff.sh`
+预期 AI 行为：
 
-这些脚本会在需要时自动拉起本地 relay backend。
+```text
+识别目标 -> 运行 harness verify -> 读取 HarnessGate -> 汇报证据
+```
 
-### 运行时证据边界
+主要 wrapper：
 
-本项目严格区分“结构检查”和“运行时证明”：
+```bash
+./scripts/harness-verify.sh \
+  --target web \
+  --url http://127.0.0.1:5173 \
+  --goal "用户能打开商品列表" \
+  --pretty
+```
 
-- `project verify`：回答“项目结构上是否已经具备注入条件”
-- 不带 `runId` 的 `web verify`：回答“仅从结构检查能看出什么”
-- `web verify --runId <runId>` 或 `/ai/run/:runId/readiness`：回答“这轮真实运行到底收到了哪些信号”
-- `miniapp verify`：回答“小程序结构和接入是否具备运行闭环前提”
-- `miniapp run/scenario/closure`：回答“是否真的执行了动作链、拿到了闭环证据、可以给出 release decision”
+报告和证据 wrapper：
 
-这是有意设计的边界收敛：结构准备度不等于运行闭环完成。
+```bash
+./scripts/harness-report.sh --harnessRunId <harnessRunId> --pretty
+./scripts/harness-evidence.sh --harnessRunId <harnessRunId> --ref <artifactRef> --pretty
+```
 
-### 快速开始
+手动 runtime 设置只面向维护者和贡献者；见 [开发](#开发)。
 
-#### 1. 启动 runtime 服务
+### Web 验证
+
+Web 验证可以使用：
+
+- `--url <targetUrl>`
+- `DEV_LOG_RELAY_TARGET_URL`
+- 自动启动已解析目标项目的 package script
+
+常用命令：
+
+```bash
+./scripts/harness-verify.sh \
+  --target web \
+  --url http://127.0.0.1:5173 \
+  --goal "用户能搜索商品" \
+  --visual \
+  --a11y \
+  --pretty
+```
+
+登录态项目可以使用 Playwright storage state：
+
+```bash
+./scripts/harness-verify.sh \
+  --target web \
+  --url http://127.0.0.1:5173 \
+  --storageState /abs/path/storage-state.json \
+  --pretty
+```
+
+### Miniapp 验证
+
+Miniapp 完工证明必须来自真实可执行证据。默认 harness 路径会尽最大努力准备受控微信开发者工具 profile、启动/检查 sidecar、连接内置 `devtools-automator` driver，并执行用户可见黑盒动作；只有遇到系统权限、微信登录、业务授权等硬边界时才请求用户配合。
+
+默认 Miniapp harness 路径：
+
+```bash
+./scripts/harness-verify.sh \
+  --target miniapp \
+  --pretty
+```
+
+使用外部 driver module 覆盖内置 driver：
+
+```bash
+./scripts/harness-verify.sh \
+  --target miniapp \
+  --driverModule /abs/path/driver.mjs \
+  --pretty
+```
+
+使用 Computer Use ledger 桥接：
+
+```bash
+./scripts/harness-verify.sh \
+  --target miniapp \
+  --driver computer-use \
+  --ledger /abs/path/computer-use-ledger.json \
+  --pretty
+```
+
+诊断 Miniapp driver 配置：
+
+```bash
+./scripts/miniapp-doctor.sh --fix
+```
+
+Miniapp 验证默认使用 Dev Log Relay 管理的微信开发者工具专用 profile。bootstrap 会把固定服务端口配置写入 runtime artifact home；如果配置了 `DEV_LOG_RELAY_HOME`，则写入该目录。闭环证据不依赖用户日常打开的微信开发者工具窗口。
+
+需要持久管理本机 DevTools 生命周期时，执行 AI 可以安装可选 sidecar：
+
+```bash
+./scripts/miniapp-sidecar.sh install --start
+```
+
+需要通过 Codex Computer Use 做首次 UI 配对时，执行 AI 可以请求配对合约：
+
+```bash
+./scripts/miniapp-bootstrap.sh --fix --driver computer-use
+```
+
+如果自动化撞到系统或账号硬边界，报告会返回 `forExecutingAI.userActionRequest`，包含最少用户操作、原因码和可复现重试命令。sidecar、bootstrap 和 Computer Use 配对只负责准备环境；普通“已截图”描述只算诊断信息，不算可见证明。Miniapp release 仍然必须依赖真实 action ledger、明确的用户可见 UI 证据、runtime event、内置 driver 的受控 profile isolation，并通过 HarnessGate。
+
+### 黑盒与证据工具
+
+需要检查、调试或导出 harness 证据链时，可以使用低层命令：
 
 ```bash
 cd runtime
-npm install
-npm run build
-npm run start
+npm run cli -- blackbox discover --target web --url http://127.0.0.1:5173 --pretty
+npm run cli -- blackbox plan --target web --url http://127.0.0.1:5173 --goal "用户能搜索" --pretty
+npm run cli -- blackbox run --target web --url http://127.0.0.1:5173 --driver playwright --pretty
+npm run cli -- blackbox report --runId <runId> --pretty
+npm run cli -- blackbox capsule --runId <runId> --pretty
+npm run cli -- blackbox trace --runId <runId> --format summary --pretty
+npm run cli -- blackbox export --runId <runId> --format playwright --pretty
+npm run cli -- store inspect --harnessRunId <harnessRunId> --pretty
 ```
 
-默认地址：
+默认 export 写入 runtime artifact store。只有显式提供 `--out <path>` 时，才会写入用户指定位置。
 
-```text
-http://127.0.0.1:5077
-```
+### Runtime Store
 
-#### 2. 通过 skill 入口执行
+Runtime store 会持久化：
 
-例如：
+- run 和 step
+- event
+- scenario report
+- blackbox plan 和 report
+- evidence capsule
+- action trace 和 Playwright trace
+- screenshot 和 accessibility artifact
+- harness evidence index
+- artifact manifest
+
+覆盖存储目录：
 
 ```bash
-./scripts/doctor.sh target --target web --pretty
-./scripts/project-verify.sh --target web --pretty
-./scripts/web-autoloop.sh --target web --pretty
-./scripts/miniapp-verify.sh --pretty
-./scripts/miniapp-run.sh --templateName miniapp_home_entry --pretty
-./scripts/miniapp-scenario.sh --runId <runId> --templateName miniapp_home_entry --pretty
-./scripts/miniapp-closure.sh --runId <runId> --pretty
+export DEV_LOG_RELAY_RUNTIME_STORE_DIR=/abs/path/relay-store
 ```
 
-#### 3. 查看 runtime 说明
+查看或清理 artifact：
 
-API、CLI、适配器、artifact 和示例请看 [runtime/README.md](./runtime/README.md)。
+```bash
+cd runtime
+npm run cli -- store inspect --runId <runId> --pretty
+npm run cli -- store inspect --harnessRunId <harnessRunId> --pretty
+npm run cli -- store cleanup --olderThanDays 30 --dryRun --pretty
+npm run cli -- store cleanup --olderThanDays 30 --confirm --pretty
+```
 
-### 最佳实践
+清理默认只做 dry-run；只有显式传入 `--confirm` 才会删除 runtime store 内的过期 artifact。
 
-- 优先做 runtime relay 注入，而不是抓浏览器 DevTools 控制台 UI
-- 明确区分 Web 与 Miniapp，不混淆闭环标准
-- 没有真实 run 证据时，不宣称已验证完成
-- `collection / integrity` 不足时，先修接入，不直接修业务
-- Miniapp 默认必须 `verify-first`，但真正闭环必须走 `miniapp run -> miniapp scenario -> miniapp closure`
+### 开发
 
-### 开源协议
+构建：
+
+```bash
+cd runtime
+npm run build
+```
+
+运行测试：
+
+```bash
+cd runtime
+npm test -- --runInBand
+```
+
+检查空白字符：
+
+```bash
+git diff --check
+```
+
+运行 fixture benchmark：
+
+```bash
+cd runtime
+npm run cli -- harness benchmark --fixture all --pretty
+```
+
+### 文档
+
+- [Runtime README](./runtime/README.md)：详细 CLI、API、适配器、artifact 和 fixture
+- [Skill contract](./SKILL.md)：skill 执行时的自然语言行为契约
+- [Workflow](./references/workflow.md)：推荐验证工作流
+- [Target matrix](./references/target-matrix.md)：支持和不支持的目标
+- [Driver contract](./references/driver-contract.md)：外部 driver 和 ledger 要求
+
+### 贡献
+
+欢迎贡献，但需要保持项目边界：
+
+- 生产路径必须只指向真实目标项目。
+- 不要给普通 CLI、wrapper 或 skill 路径增加 demo 回退。
+- release decision 必须绑定用户可见黑盒断言和有效证据 ref。
+- 新增 reason code、gate 行为、driver 行为和 artifact 访问时必须补测试。
+- 优先保持 local-first adapter，不把云服务或 LLM-only 判断放进核心 gate。
+
+### 协议
 
 本项目采用 MIT License，详见 [LICENSE](./LICENSE)。
-
-## English
-
-Dev Log Relay is a local skill middleware for AI-assisted work on:
-
-- browser Web projects
-- WeChat Miniapp projects
-
-Its goal is not to be a universal agent. Its goal is to help an AI actively trigger runtime validation, collect ordered evidence, diagnose failures, decide closure responsibly, and leave a strong handoff artifact when closure is not justified.
-
-### Positioning
-
-This project is built around four principles:
-
-- `skill-first`: natural-language trigger rules live in `SKILL.md`
-- `runtime-first`: runtime evidence comes before narrative confidence
-- `evidence-first`: structured evidence reports are preferred over free-form closure claims
-- `boundary-first`: only Web and WeChat Miniapp are supported targets
-
-### Suitable Tasks
-
-Use it when the AI is:
-
-- changing Web runtime code
-- changing Miniapp lifecycle, route, or request logic
-- asked to test, retest, regression-check, or verify closure
-- trying to decide whether a fix really landed
-
-### Unsuitable Tasks
-
-This project intentionally does not claim support for:
-
-- Electron
-- React Native
-- native iOS / Android
-- desktop GUI apps
-- server batch jobs
-- non-browser graphics apps
-- documentation-only or mechanical-only edits
-
-### Default Flow
-
-Once runtime work is detected, the skill should not jump straight to "done".
-
-Recommended order:
-
-1. detect whether the target is supported
-2. verify project integration readiness
-3. start or inspect a run
-4. bind the current `runId / stepId`
-5. collect runtime evidence
-6. query diagnosis
-7. query closure
-8. emit handoff when closure is blocked or unresolved
-
-Default report order:
-
-1. `target / support`
-2. `trigger decision`
-3. `project verify`
-4. `runtime readiness`
-5. `collection`
-6. `diagnosis`
-7. `closure`
-8. `handoff`
-
-### Open Source License
-
-This repository is released under the MIT License. See [LICENSE](./LICENSE).

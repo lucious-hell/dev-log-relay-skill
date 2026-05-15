@@ -1,10 +1,22 @@
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import type { RelayConfig } from "../config.js";
 import type {
   AutoloopAttemptCompleteInput,
   AutoloopAttemptStartInput,
   AutoloopStopDecision,
   AutoloopStartInput,
+  BlackboxCase,
+  BlackboxActionTrace,
+  BenchmarkRunReport,
+  EvidenceCapsule,
+  BlackboxExportArtifact,
+  BlackboxFailureCategory,
+  BlackboxLocatorCandidate,
+  BlackboxDiscoverSummary,
+  BlackboxPlan,
+  BlackboxRunReport,
   CiVerificationResult,
   BugCollectionReport,
     CheckpointInput,
@@ -86,6 +98,11 @@ import type {
   TimelineItem,
   WebIntegrationReport,
   ExecutableHandoffArtifact,
+  EvidenceRefs,
+  HarnessRun,
+  HarnessVerificationReport,
+  LocatorRepairCandidate,
+  QualitySignal,
 } from "../types.js";
 import { normalizeInput } from "./normalizer.js";
 import { PriorityQueue } from "./priority-queue.js";
@@ -97,6 +114,14 @@ import { AutoloopStore } from "./autoloop-store.js";
 import { writeArtifact } from "./artifact.js";
 import { ProjectInspector } from "./project-inspector.js";
 import { ProjectMemoryStore } from "./project-memory-store.js";
+import { RuntimeArtifactStore } from "./runtime-store.js";
+import { validateBlackboxActionTrace, validateBlackboxPlan, validateBlackboxRunReport, validateTargetProject } from "./validation.js";
+import { WEB_MUTATION_KEYWORDS } from "./blackbox-observe.js";
+import { evaluateBlackboxGate, evaluateHarnessGate } from "./gate-evaluator.js";
+
+type BlackboxRecordResult =
+  | { ok: true; report: BlackboxRunReport }
+  | { ok: false; reasonCode: string; message: string };
 
 interface IngestResult {
   accepted: boolean;
@@ -658,6 +683,7 @@ export class RelayEngine {
   private readonly autoloops: AutoloopStore;
   private readonly workspaceRoot: string;
   private readonly projectMemory: ProjectMemoryStore;
+  private readonly runtimeStore: RuntimeArtifactStore;
   private readonly snapshots = new Map<string, RelaySnapshot>();
   private readonly snapshotOrder: string[] = [];
   private readonly scenarioReports = new Map<string, ScenarioRunReport>();
@@ -669,6 +695,9 @@ export class RelayEngine {
   private readonly stateSnapshots = new Map<string, StateSnapshot[]>();
   private readonly requestAttributions = new Map<string, RequestAttribution[]>();
   private readonly miniappExecutions = new Map<string, MiniappExecutionCoordinatorResult>();
+  private readonly blackboxPlans = new Map<string, BlackboxPlan>();
+  private readonly blackboxReports = new Map<string, BlackboxRunReport>();
+  private readonly harnessReports = new Map<string, HarnessVerificationReport>();
 
   constructor(private readonly config: RelayConfig) {
     this.queue = new PriorityQueue(config.maxPendingEvents);
@@ -679,21 +708,42 @@ export class RelayEngine {
     this.autoloops = new AutoloopStore();
     this.workspaceRoot = process.cwd();
     this.projectMemory = new ProjectMemoryStore(config.projectMemoryDir);
+    this.runtimeStore = new RuntimeArtifactStore(
+      config.runtimeStoreDir || path.join(config.artifactDir || "artifacts", `relay-store-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+    );
+    const persisted = this.runtimeStore.load();
+    this.runs.hydrate(persisted.runs, persisted.steps);
+    this.events.hydrate(persisted.events);
+    for (const report of persisted.scenarioReports) {
+      this.scenarioReports.set(report.runId, report);
+    }
+    for (const plan of persisted.blackboxPlans.filter((item) => validateBlackboxPlan(item).ok)) {
+      this.blackboxPlans.set(plan.planId, plan);
+    }
+    for (const report of persisted.blackboxReports.filter((item) => validateBlackboxRunReport(item).ok)) {
+      this.blackboxReports.set(report.runId, report);
+    }
+    for (const report of persisted.harnessReports || []) {
+      if (report?.harnessRunId) this.harnessReports.set(report.harnessRunId, report);
+    }
     for (const spec of TEMPLATE_SPECS) {
       this.scenarioSpecs.set(spec.id, spec);
       this.scenarioSources.set(spec.id, { scenario: spec, source: "builtin" });
     }
-    void this.loadProjectScenarios();
-    void this.loadProjectBaselines();
+    this.loadProjectScenarios();
+    this.loadProjectBaselines();
     void this.projectMemory.loadAll();
   }
 
   startRun(input: StartRunInput): TestRun {
-    return this.runs.startRun(input);
+    const run = this.runs.startRun(input);
+    this.runtimeStore.saveRun(run);
+    return run;
   }
 
   startOrchestration(input: OrchestrationStartInput) {
     const run = this.runs.startRun(input);
+    this.runtimeStore.saveRun(run);
     const session = this.orchestrations.start(run.id, input, run.target);
     return { run, session };
   }
@@ -759,18 +809,25 @@ export class RelayEngine {
     if (run) {
       this.captureDerivedRunFacts(run.id);
       void this.syncProjectMemoryForRun(run.id);
+      this.runtimeStore.saveRun(run);
+      for (const step of this.runs.listSteps(run.id)) {
+        this.runtimeStore.saveStep(step);
+      }
     }
     return run;
   }
 
   startStep(runId: string, input: StartStepInput) {
-    return this.runs.startStep(runId, input, this.events.assignSequence());
+    const step = this.runs.startStep(runId, input, this.events.assignSequence());
+    if (step) this.runtimeStore.saveStep(step);
+    return step;
   }
 
   endStep(runId: string, stepId: string, input: EndStepInput) {
     const step = this.runs.endStep(runId, stepId, input, this.events.assignSequence());
     if (step) {
       this.captureActionBoundaries(runId);
+      this.runtimeStore.saveStep(step);
     }
     return step;
   }
@@ -951,6 +1008,920 @@ export class RelayEngine {
       conflicts: scenarios.filter((entry) => Boolean(entry.conflictWith)).map((entry) => `${entry.scenario.id}:${entry.conflictWith}`),
       recommendations: scenarios.length > 0 ? [] : ["Add scenario files under tooling/scenarios or use built-in templates."],
     };
+  }
+
+  createBlackboxPlan(input: {
+    target?: SupportedTarget;
+    targetProject?: Record<string, unknown>;
+    goals?: string[];
+    maxCases?: number;
+    allowMutations?: boolean;
+    projectCheck?: Record<string, unknown>;
+    discoverSummary?: BlackboxDiscoverSummary;
+  }): BlackboxPlan {
+    const target = input.target === "miniapp" ? "miniapp" : "web";
+    const targetProjectValidation = validateTargetProject(input.targetProject || {}, target);
+    if (!targetProjectValidation.ok) {
+      throw new Error(targetProjectValidation.reasonCode || "target_project_invalid");
+    }
+    const maxCases = Math.max(1, Math.min(20, Number(input.maxCases || 5)));
+    const mutationKeywords = WEB_MUTATION_KEYWORDS;
+    const allowMutations = Boolean(input.allowMutations);
+    const goals = (input.goals || []).map((goal) => String(goal).trim()).filter(Boolean);
+    const skippedCandidates: string[] = [];
+    const isMutationGoal = (value: string) => mutationKeywords.some((keyword) => value.toLowerCase().includes(keyword.toLowerCase()));
+    const cases: BlackboxCase[] = [];
+    const discoverCandidates = target === "web" ? input.discoverSummary?.actionCandidates || [] : [];
+    const discoverIntents = target === "web" ? input.discoverSummary?.intentCandidates || [] : [];
+    const discoverControls = target === "web" ? input.discoverSummary?.controls || [] : [];
+    const formIntent = discoverIntents.find((intent) => intent.kind === "form");
+    const navIntent = discoverIntents.find((intent) => intent.kind === "nav");
+    const safeDiscoverLink =
+      discoverCandidates.find((control) => (control.role === "navigation" || control.role === "link") && control.selector && (allowMutations || control.risk !== "mutation")) ||
+      discoverControls.find((control) => (control.role === "navigation" || control.role === "link") && control.selector && (allowMutations || control.risk !== "mutation"));
+    const safeDiscoverInput =
+      discoverCandidates.find((control) => control.role === "input" && control.selector && (allowMutations || control.risk !== "mutation")) ||
+      discoverControls.find((control) => control.role === "input" && control.selector && (allowMutations || control.risk !== "mutation"));
+    const projectLocalScenarios = this.listProjectScenarioCatalog(target).scenarios.filter((entry) => entry.source === "project_local");
+    const withNonce = (testCase: BlackboxCase): BlackboxCase => ({
+      ...testCase,
+      caseNonce: testCase.caseNonce || randomUUID(),
+      preconditions: testCase.preconditions || [],
+      dataPolicy: testCase.dataPolicy || "read_only",
+      mutationPolicy: testCase.mutationPolicy || (allowMutations ? "allow_explicit" : "forbid"),
+      waitStrategy: testCase.waitStrategy || { kind: "visible_assertion", timeoutMs: 30_000 },
+      branchAssertions: testCase.branchAssertions || [],
+      cleanupPolicy: testCase.cleanupPolicy || "none",
+    });
+    const addCase = (testCase: BlackboxCase) => {
+      if (!allowMutations && (testCase.risk === "mutation" || isMutationGoal(testCase.userGoal))) {
+        skippedCandidates.push(`${testCase.id}:mutation_risk`);
+        return;
+      }
+      cases.push(withNonce(testCase));
+    };
+    for (const entry of projectLocalScenarios) {
+      const scenario = entry.scenario;
+      addCase({
+        id: `blackbox_project_${scenario.id}`,
+        target,
+        userGoal: scenario.expectations[0] || scenario.flow || scenario.id,
+        entry: target === "web" ? { route: scenario.entry.route || "/" } : { page: scenario.entry.page || scenario.pagePath || "" },
+        steps:
+          target === "web"
+            ? [
+                { id: "open-entry", action: "open", route: scenario.entry.route || "/" },
+                { id: "observe-project-scenario", action: "observe", selector: "body" },
+              ]
+            : (scenario.actions || [{ id: "enter-page", type: "enter_page", pagePath: scenario.entry.page || scenario.pagePath || "" }]).map((action) => {
+                const actionType =
+                  action.type === "tap"
+                    ? "click"
+                    : action.type === "input"
+                      ? "fill"
+                      : action.type === "launch" || action.type === "share_entry" || action.type === "retry"
+                        ? "enter_page"
+                        : action.type;
+                return {
+                  id: action.id,
+                  action: actionType,
+                  pagePath: action.pagePath,
+                  selector: action.selector,
+                  value: action.value,
+                };
+              }),
+        visibleAssertions: [{ id: "project_visible_result", kind: target === "web" ? "selector_visible" : "visible_change", selector: "body" }],
+        risk: scenario.riskLevel === "critical" || scenario.riskLevel === "high" ? "mutation" : "safe",
+        source: "project_local",
+      });
+    }
+
+    if (target === "web") {
+      addCase({
+        id: "blackbox_web_home_visible",
+        target,
+        userGoal: "用户打开目标项目首页后能看到可用界面。",
+        entry: { url: String(input.targetProject?.targetUrl || "") },
+        steps: [
+          { id: "open-home", action: "open" },
+          { id: "observe-visible-ui", action: "observe", selector: "body" },
+        ],
+        visibleAssertions: [
+          { id: "body_visible", kind: "selector_visible", selector: "body" },
+          { id: "no_visible_error", kind: "no_visible_error" },
+        ],
+        risk: "safe",
+        source: "heuristic",
+      });
+      addCase({
+        id: "blackbox_web_navigation_visible",
+        target,
+        userGoal: "用户能看到主要导航、按钮或链接，并可判断页面有下一步操作入口。",
+        entry: { url: String(input.targetProject?.targetUrl || "") },
+        steps: [
+          { id: "open-home", action: "open" },
+          { id: "observe-navigation", action: "observe", selector: "a,button,[role=button],nav" },
+        ],
+        visibleAssertions: [{ id: "interactive_visible", kind: "selector_visible", selector: "a,button,[role=button],nav" }],
+        risk: "safe",
+        source: "heuristic",
+      });
+      addCase({
+        id: "blackbox_web_input_or_filter_visible",
+        target,
+        userGoal: "用户能看到搜索、过滤或表单输入入口时，可从界面发起查询类操作。",
+        entry: { url: String(input.targetProject?.targetUrl || "") },
+        steps: [
+          { id: "open-home", action: "open" },
+          { id: "observe-input", action: "observe", selector: "input,textarea,select,[role=searchbox]" },
+        ],
+        visibleAssertions: [{ id: "input_visible", kind: "selector_visible", selector: "input,textarea,select,[role=searchbox]" }],
+        risk: "safe",
+        source: "heuristic",
+      });
+    } else {
+      const pageMap = input.projectCheck && typeof input.projectCheck.pageMap === "object" ? input.projectCheck.pageMap as Record<string, unknown> : {};
+      const resolvedPageFiles =
+        input.projectCheck && typeof input.projectCheck.resolvedPageFiles === "object"
+          ? Object.keys(input.projectCheck.resolvedPageFiles as Record<string, unknown>)
+          : [];
+      const pages = uniqValues([...Object.keys(pageMap), ...resolvedPageFiles]).slice(0, Math.max(1, maxCases));
+      const firstPage = pages[0] || "/pages/index/index";
+      addCase({
+        id: "blackbox_miniapp_entry_visible",
+        target,
+        userGoal: "用户进入小程序首屏后能看到真实页面，并产生可审计的动作账本。",
+        entry: { page: firstPage },
+        steps: [
+          { id: "enter-page", action: "enter_page", pagePath: firstPage },
+          { id: "observe-page", action: "observe" },
+        ],
+        visibleAssertions: [{ id: "page_visible", kind: "visible_change" }],
+        risk: "safe",
+        source: "heuristic",
+      });
+      for (const page of pages.slice(1)) {
+        addCase({
+          id: `blackbox_miniapp_page_${cases.length + 1}`,
+          target,
+          userGoal: `用户能进入页面 ${page} 并看到页面变化。`,
+          entry: { page },
+          steps: [
+            { id: "enter-page", action: "enter_page", pagePath: page },
+            { id: "observe-page", action: "observe" },
+          ],
+          visibleAssertions: [{ id: "page_visible", kind: "visible_change" }],
+          risk: "safe",
+          source: "heuristic",
+        });
+      }
+    }
+
+    for (const [index, goal] of goals.entries()) {
+      const goalLower = goal.toLowerCase();
+      if (!allowMutations && isMutationGoal(goal)) {
+        skippedCandidates.push(`blackbox_${target}_goal_${index + 1}:mutation_risk`);
+        continue;
+      }
+      const searchLike = /(search|filter|query|find|搜索|筛选|查询|查找)/i.test(goal);
+      const navigateLike = /(open|go to|navigate|view|detail|details|进入|打开|查看|详情|浏览)/i.test(goal);
+      if (!searchLike && !navigateLike) {
+        skippedCandidates.push(`blackbox_${target}_goal_${index + 1}:goal_unmapped`);
+        continue;
+      }
+      const queryText =
+        goal.match(/(?:搜索|查询|查找|筛选)\s*([^，。,. ]+)/)?.[1] ||
+        goal.match(/(?:search|find|query|filter)\s+([^,.]+)/i)?.[1]?.trim() ||
+        "test";
+      addCase({
+        id: `blackbox_${target}_goal_${index + 1}`,
+        target,
+        userGoal: goal,
+        entry: target === "web" ? { url: String(input.targetProject?.targetUrl || "") } : {},
+        steps:
+          target === "web" && searchLike
+            ? [
+                { id: "open-entry", action: "open" },
+                { id: "wait-search-input", action: "wait_visible", selector: safeDiscoverInput?.selector || "input,textarea,[role=searchbox]", locator: safeDiscoverInput?.preferredLocator },
+                { id: "fill-search-input", action: "fill", selector: safeDiscoverInput?.selector || "input,textarea,[role=searchbox]", locator: safeDiscoverInput?.preferredLocator, value: queryText },
+                { id: "submit-search", action: "press", value: "Enter" },
+                { id: "observe-search-result", action: "observe", selector: "body" },
+              ]
+            : target === "web"
+              ? [
+                  { id: "open-entry", action: "open" },
+                  { id: "wait-navigation-target", action: "wait_visible", selector: safeDiscoverLink?.selector || "a[href],nav a[href]", locator: safeDiscoverLink?.preferredLocator },
+                  { id: "click-navigation-target", action: "click", selector: safeDiscoverLink?.selector || "a[href],nav a[href]", locator: safeDiscoverLink?.preferredLocator },
+                  { id: "observe-navigation-result", action: "observe", selector: "body" },
+                ]
+              : [
+                  { id: "observe-entry", action: "observe" },
+                ],
+        visibleAssertions:
+          target === "web" && navigateLike && !searchLike
+            ? [
+                { id: "navigation_changed", kind: "url_changed" },
+                { id: "visible_after_navigation", kind: "selector_visible", selector: "body" },
+                { id: "no_visible_error", kind: "no_visible_error" },
+              ]
+            : [
+                { id: "visible_changed_for_goal", kind: "visible_change" },
+                { id: "no_visible_error", kind: "no_visible_error" },
+              ],
+        risk: "safe",
+        source: "goal",
+      });
+    }
+
+    if (target === "web" && input.discoverSummary) {
+      const link = safeDiscoverLink;
+      const inputControl = safeDiscoverInput;
+      for (const candidate of [...discoverCandidates, ...discoverControls]) {
+        if (!allowMutations && candidate.risk === "mutation") {
+          const candidateId = "id" in candidate ? candidate.id : candidate.selector;
+          skippedCandidates.push(`${candidateId}:mutation_risk`);
+        }
+      }
+      if (inputControl) {
+        addCase({
+          id: "blackbox_web_discovered_input_flow",
+          target,
+          userGoal: `用户可使用界面输入入口${inputControl.text ? `：${inputControl.text}` : ""}。`,
+          entry: { url: input.discoverSummary.targetUrl || String(input.targetProject?.targetUrl || "") },
+          steps: [
+            { id: "open-entry", action: "open" },
+            { id: "wait-discovered-input", action: "wait_visible", selector: inputControl.selector, locator: inputControl.preferredLocator },
+            { id: "fill-discovered-input", action: "fill", selector: inputControl.selector, locator: inputControl.preferredLocator, value: "test" },
+            { id: "observe-after-input", action: "observe", selector: "body" },
+          ],
+          visibleAssertions: [
+            { id: "visible_after_input", kind: "selector_visible", selector: "body" },
+            { id: "no_visible_error", kind: "no_visible_error" },
+          ],
+          branchAssertions: formIntent?.assertionHints || [],
+          risk: inputControl.risk === "mutation" ? "mutation" : "safe",
+          source: "heuristic",
+        });
+      }
+      if (link) {
+        addCase({
+          id: "blackbox_web_discovered_navigation_flow",
+          target,
+          userGoal: `用户可点击主要导航入口${link.text ? `：${link.text}` : ""}。`,
+          entry: { url: input.discoverSummary.targetUrl || String(input.targetProject?.targetUrl || "") },
+          steps: [
+            { id: "open-entry", action: "open" },
+            { id: "wait-discovered-link", action: "wait_visible", selector: link.selector, locator: link.preferredLocator },
+            { id: "click-discovered-link", action: "click", selector: link.selector, locator: link.preferredLocator },
+            { id: "observe-after-navigation", action: "observe", selector: "body" },
+          ],
+          visibleAssertions: [
+            { id: "navigation_visible_result", kind: "selector_visible", selector: "body" },
+            { id: "no_visible_error", kind: "no_visible_error" },
+          ],
+          branchAssertions: navIntent?.assertionHints || [],
+          risk: link.risk === "mutation" ? "mutation" : "safe",
+          source: "heuristic",
+        });
+      }
+      for (const intent of discoverIntents.filter((item) => item.kind === "empty" || item.kind === "error" || item.kind === "loading").slice(0, 2)) {
+        addCase({
+          id: `blackbox_web_${intent.kind}_state_visible`,
+          target,
+          userGoal: `用户能从界面识别 ${intent.kind} 状态。`,
+          entry: { url: input.discoverSummary.targetUrl || String(input.targetProject?.targetUrl || "") },
+          steps: [
+            { id: "open-entry", action: "open" },
+            { id: `observe-${intent.kind}-state`, action: "observe", selector: "body" },
+          ],
+          visibleAssertions: intent.assertionHints.length > 0 ? intent.assertionHints : [{ id: `${intent.kind}_state_visible`, kind: "selector_visible", selector: "body" }],
+          risk: intent.risk,
+          source: "heuristic",
+          preconditions: [`discover_intent:${intent.id}`],
+          branchAssertions: intent.assertionHints,
+        });
+      }
+    }
+
+    const orderedCases = cases
+      .slice()
+      .sort((left, right) => {
+        const rank = (testCase: BlackboxCase) =>
+          testCase.source === "project_local"
+            ? 0
+            : testCase.source === "goal"
+              ? 1
+              : testCase.id.includes("discovered")
+                ? 2
+                : 3;
+        return rank(left) - rank(right);
+      })
+      .slice(0, maxCases);
+    const plan: BlackboxPlan = {
+      planId: `blackbox-${this.createCheckpoint()}`,
+      planNonce: randomUUID(),
+      target,
+      targetProject: input.targetProject || {},
+      cases: orderedCases,
+      generationSource: goals.length > 0 ? "mixed" : "heuristic",
+      skippedCandidates,
+      safetyPolicy: {
+        allowMutations,
+        mutationKeywords,
+      },
+      discoverSummary: input.discoverSummary,
+    };
+    const validation = validateBlackboxPlan(plan);
+    if (!validation.ok) {
+      throw new Error(validation.reasonCode || "blackbox_plan_invalid");
+    }
+    this.blackboxPlans.set(plan.planId, plan);
+    plan.evidenceRefs = {
+      blackboxPlan: this.runtimeStore.saveBlackboxPlan(plan),
+    };
+    this.blackboxPlans.set(plan.planId, plan);
+    this.runtimeStore.saveBlackboxPlan(plan);
+    return plan;
+  }
+
+  recordBlackboxReportResult(report: BlackboxRunReport): BlackboxRecordResult {
+    const reportValidation = validateBlackboxRunReport(report);
+    if (!reportValidation.ok) {
+      return { ok: false, reasonCode: reportValidation.reasonCode || "blackbox_report_invalid", message: reportValidation.message || "Blackbox report is invalid." };
+    }
+    const run = this.runs.getRun(report.runId);
+    const plan = this.blackboxPlans.get(report.planId);
+    if (!run || !plan || run.target !== report.target || plan.target !== report.target) {
+      return { ok: false, reasonCode: "blackbox_report_invalid", message: "Blackbox report must match a real run and plan for the same target." };
+    }
+    const targetProjectValidation = validateTargetProject(report.targetProject, report.target);
+    if (!targetProjectValidation.ok) {
+      return { ok: false, reasonCode: targetProjectValidation.reasonCode || "target_project_invalid", message: targetProjectValidation.message || "targetProject is invalid." };
+    }
+    const samePath = (left: unknown, right: unknown) => {
+      const leftValue = String(left || "");
+      const rightValue = String(right || "");
+      return Boolean(leftValue && rightValue && path.resolve(leftValue) === path.resolve(rightValue));
+    };
+    const reportTargetProject = targetProjectValidation.value || {};
+    const planTargetProject = plan.targetProject || {};
+    if (
+      (planTargetProject.workspaceRoot && !samePath(planTargetProject.workspaceRoot, reportTargetProject.workspaceRoot)) ||
+      (planTargetProject.resolvedProjectRoot && !samePath(planTargetProject.resolvedProjectRoot, reportTargetProject.resolvedProjectRoot))
+    ) {
+      return { ok: false, reasonCode: "target_project_invalid", message: "Blackbox report target project does not match its plan." };
+    }
+    const runMetadata = run.metadata || {};
+    const runTargetProject = runMetadata.targetProject && typeof runMetadata.targetProject === "object" ? runMetadata.targetProject as Record<string, unknown> : {};
+    if (
+      (runMetadata.projectRoot && !samePath(runMetadata.projectRoot, reportTargetProject.workspaceRoot)) ||
+      (runTargetProject.workspaceRoot && !samePath(runTargetProject.workspaceRoot, reportTargetProject.workspaceRoot)) ||
+      (runTargetProject.resolvedProjectRoot && !samePath(runTargetProject.resolvedProjectRoot, reportTargetProject.resolvedProjectRoot))
+    ) {
+      return { ok: false, reasonCode: "target_project_invalid", message: "Blackbox report target project does not match the run invocation workspace." };
+    }
+    const planCaseIds = new Set(plan.cases.map((testCase) => testCase.id));
+    if (report.cases.some((testCase) => !planCaseIds.has(testCase.caseId))) {
+      return { ok: false, reasonCode: "blackbox_report_invalid", message: "Blackbox report contains a case that is not in the plan." };
+    }
+    if (String(plan.targetProject.targetUrl || "") && String(report.targetProject.targetUrl || "") !== String(plan.targetProject.targetUrl || "")) {
+      return { ok: false, reasonCode: "target_project_invalid", message: "Blackbox report target URL does not match its plan." };
+    }
+    const events = this.events.listByRun(report.runId);
+    const passedCases = report.cases.filter((testCase) => testCase.status === "passed");
+    if (passedCases.length === 0 || passedCases.some((testCase) => testCase.visibleEvidence.length === 0)) {
+      return { ok: false, reasonCode: "visible_evidence_required", message: "At least one passed blackbox case with visible evidence is required." };
+    }
+    const hasEvidence = (caseId: string) =>
+      events.some((event) => {
+        const visibleEvidence = Array.isArray(event.context?.visibleEvidence) ? event.context.visibleEvidence : [];
+        return (
+          event.tags.includes("blackbox_assertion") &&
+          event.tags.includes("visible_evidence") &&
+          (event.message.includes(`blackbox_assertion:${caseId}:passed`) || event.tags.includes(`blackbox_assertion:${caseId}:passed`)) &&
+          visibleEvidence.length > 0
+        );
+      });
+    if (passedCases.some((testCase) => !hasEvidence(testCase.caseId))) {
+      return { ok: false, reasonCode: "visible_evidence_required", message: "Passed blackbox cases require matching run-scoped blackbox assertion events with visible evidence." };
+    }
+    const traceEvents = events.filter((event) => event.tags.includes("blackbox_action_trace") && event.context?.actionTrace);
+    for (const event of traceEvents) {
+      const trace = event.context.actionTrace as BlackboxActionTrace;
+      const traceValidation = validateBlackboxActionTrace(trace);
+      if (traceValidation.ok && trace && trace.runId === report.runId && trace.planId === report.planId && planCaseIds.has(trace.caseId)) {
+        this.runtimeStore.saveBlackboxActionTrace(trace);
+      }
+    }
+    const baseReleaseDecision = this.getRunReleaseDecision(report.runId);
+    const releaseBlockingItems = baseReleaseDecision && Array.isArray(baseReleaseDecision.blockingItems)
+      ? baseReleaseDecision.blockingItems.map(String).filter((item) => !item.startsWith("blackbox") && !item.startsWith(`scenario:${report.planId}_suite:`))
+      : [];
+    const runtimeBlockingItems = uniqValues([...releaseBlockingItems, ...this.blackboxRuntimeBlockingItems(report.runtimeEvidence)]);
+    const qualityBlockingItems = (report.qualitySignals || [])
+      .filter((signal) => signal.severity === "blocking")
+      .map((signal) => signal.kind);
+    runtimeBlockingItems.push(...qualityBlockingItems);
+    const blockingFailedCases = report.cases.filter((testCase) => testCase.status === "failed").map((testCase) => testCase.caseId);
+    const manualReviewCases = report.cases.filter((testCase) => testCase.status === "manual_review_required").map((testCase) => testCase.caseId);
+    const blockingPassedCases = passedCases.map((testCase) => testCase.caseId);
+    const storeEvidenceRefs = this.runtimeStore.evidenceRefsFor(report.runId, report.planId);
+    const reportEvidenceRefs = {
+      screenshots: (report.evidenceRefs?.screenshots || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(report.runId, ref, ".png")),
+      accessibility: (report.evidenceRefs?.accessibility || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(report.runId, ref, "-accessibility.json")),
+      actionTraces: (report.evidenceRefs?.actionTraces || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(report.runId, ref, ".trace.json")),
+      playwrightTraces: (report.evidenceRefs?.playwrightTraces || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(report.runId, ref, ".playwright-trace.zip")),
+      locatorRepairs: (report.evidenceRefs?.locatorRepairs || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(report.runId, ref, ".locator-repair.json")),
+      exports: (report.evidenceRefs?.exports || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(report.runId, ref, ".spec.ts")),
+    };
+    const evidenceRefs: EvidenceRefs = {
+      ...storeEvidenceRefs,
+      screenshots: uniqValues([...(storeEvidenceRefs.screenshots || []), ...reportEvidenceRefs.screenshots]),
+      accessibility: uniqValues([...(storeEvidenceRefs.accessibility || []), ...reportEvidenceRefs.accessibility]),
+      actionTraces: uniqValues([...(storeEvidenceRefs.actionTraces || []), ...reportEvidenceRefs.actionTraces]),
+      playwrightTraces: uniqValues([...(storeEvidenceRefs.playwrightTraces || []), ...reportEvidenceRefs.playwrightTraces]),
+      locatorRepairs: uniqValues([...(storeEvidenceRefs.locatorRepairs || []), ...reportEvidenceRefs.locatorRepairs]),
+      exports: uniqValues([...(storeEvidenceRefs.exports || []), ...reportEvidenceRefs.exports]),
+      evidenceCapsule: storeEvidenceRefs.evidenceCapsule || report.evidenceRefs?.evidenceCapsule,
+    };
+    const failureTaxonomy = this.classifyBlackboxFailures(report, runtimeBlockingItems);
+    const coverageGaps = this.blackboxCoverageGaps(plan, report);
+    const stored: BlackboxRunReport = {
+      ...report,
+      releaseDecision: baseReleaseDecision ? baseReleaseDecision as unknown as Record<string, unknown> : undefined,
+      blackboxGate: evaluateBlackboxGate({ blockingPassedCases, blockingFailedCases, manualReviewCases, runtimeBlockingItems }),
+      evidenceRefs,
+    };
+    const locatorRepairEvents = events.filter((event) => event.tags.includes("locator_repair") && event.context?.locatorRepair);
+    const locatorRepairRefs: string[] = [];
+    for (const event of locatorRepairEvents) {
+      const repair = event.context.locatorRepair as LocatorRepairCandidate;
+      if (repair && repair.runId === report.runId && repair.planId === report.planId && planCaseIds.has(repair.caseId)) {
+        locatorRepairRefs.push(this.runtimeStore.saveLocatorRepair(repair));
+      }
+    }
+    stored.locatorRepairRefs = uniqValues([...(report.locatorRepairRefs || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(report.runId, ref, ".locator-repair.json")), ...locatorRepairRefs, ...(evidenceRefs.locatorRepairs || [])]);
+    stored.visualEvidenceRefs = uniqValues([...(evidenceRefs.screenshots || []), ...(report.visualEvidenceRefs || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(report.runId, ref, ".png"))]);
+    stored.a11yEvidenceRefs = uniqValues([...(evidenceRefs.accessibility || []), ...(report.a11yEvidenceRefs || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(report.runId, ref, "-accessibility.json"))]);
+    stored.qualitySignals = report.qualitySignals || [];
+    stored.forExecutingAI = {
+      verifiedGoals: stored.cases.filter((testCase) => testCase.status === "passed").map((testCase) => testCase.userGoal),
+      failedCases: blockingFailedCases,
+      userVisibleFindings: stored.visibleEvidence.slice(0, 10),
+      runtimeClues: stored.runtimeEvidence.slice(0, 10),
+      validatedUserFlows: stored.cases.filter((testCase) => testCase.status === "passed").map((testCase) => testCase.userGoal),
+      blockedUserFlows: stored.cases.filter((testCase) => testCase.status === "failed" || testCase.status === "manual_review_required").map((testCase) => testCase.userGoal),
+      traceRefs: evidenceRefs.actionTraces || [],
+      coverageGaps,
+      failureTaxonomy,
+      nextRecommendation:
+        runtimeBlockingItems.length > 0
+          ? "黑盒可见流程不能放行：release decision 仍有阻塞项，需要先修 runtime failure。"
+          : blockingFailedCases.length > 0
+            ? "修复失败用户流程或补充更具体的黑盒目标后重跑。"
+            : manualReviewCases.length > 0
+              ? "locator repair 只产生人工复核证据，不能自动放行；请确认新 locator 后重跑或导出稳定用例。"
+            : blockingPassedCases.length > 0
+              ? "至少一个阻塞黑盒用户流程已通过，可继续结合服务端 release decision 判断是否 handoff。"
+              : "补接入真实 driver 或可执行 ledger 后重跑黑盒流程。",
+    };
+    this.blackboxReports.set(stored.runId, stored);
+    const finalReleaseDecision = this.getRunReleaseDecision(report.runId);
+    if (finalReleaseDecision) {
+      stored.releaseDecision = finalReleaseDecision as unknown as Record<string, unknown>;
+      stored.forExecutingAI.nextRecommendation =
+        finalReleaseDecision.decision === "hold"
+          ? "黑盒报告已写入，但 release decision 仍为 hold；优先处理 blockingItems 后重跑。"
+          : stored.blackboxGate?.passed
+            ? "黑盒用户流程和服务端 release gate 已同源记录，可交给执行 AI 进入 handoff/人工复核判断。"
+            : stored.forExecutingAI.nextRecommendation;
+      this.blackboxReports.set(stored.runId, stored);
+    }
+    const capsule = this.createEvidenceCapsule(stored);
+    const capsuleRef = this.runtimeStore.saveEvidenceCapsule(capsule);
+    const finalStoreRefs = this.runtimeStore.evidenceRefsFor(stored.runId, stored.planId);
+    stored.evidenceRefs = {
+      ...finalStoreRefs,
+      screenshots: uniqValues([...(finalStoreRefs.screenshots || []), ...(evidenceRefs.screenshots || [])]),
+      accessibility: uniqValues([...(finalStoreRefs.accessibility || []), ...(evidenceRefs.accessibility || [])]),
+      actionTraces: uniqValues([...(finalStoreRefs.actionTraces || []), ...(evidenceRefs.actionTraces || [])]),
+      playwrightTraces: uniqValues([...(finalStoreRefs.playwrightTraces || []), ...(evidenceRefs.playwrightTraces || [])]),
+      locatorRepairs: uniqValues([...(finalStoreRefs.locatorRepairs || []), ...(evidenceRefs.locatorRepairs || [])]),
+      exports: uniqValues([...(finalStoreRefs.exports || []), ...(evidenceRefs.exports || [])]),
+      evidenceCapsule: finalStoreRefs.evidenceCapsule || capsuleRef,
+    };
+    stored.forExecutingAI.evidenceCapsuleRef = capsuleRef;
+    this.runtimeStore.saveBlackboxReport(stored);
+    this.runtimeStore.artifactManifestForRun(stored.runId);
+    return { ok: true, report: stored };
+  }
+
+  recordBlackboxReport(report: BlackboxRunReport): BlackboxRunReport | null {
+    const result = this.recordBlackboxReportResult(report);
+    return result.ok ? result.report : null;
+  }
+
+  getBlackboxReport(runId: string): BlackboxRunReport | null {
+    return this.blackboxReports.get(runId) || null;
+  }
+
+  getBlackboxPlan(planId: string): BlackboxPlan | null {
+    return this.blackboxPlans.get(planId) || null;
+  }
+
+  getEvidenceRefs(runId: string): EvidenceRefs {
+    const report = this.getBlackboxReport(runId);
+    const storeRefs = this.runtimeStore.evidenceRefsFor(runId, report?.planId);
+    if (!report?.evidenceRefs) return storeRefs;
+    const reportEvidenceRefs = {
+      screenshots: (report.evidenceRefs.screenshots || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(runId, ref, ".png")),
+      accessibility: (report.evidenceRefs.accessibility || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(runId, ref, "-accessibility.json")),
+      actionTraces: (report.evidenceRefs.actionTraces || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(runId, ref, ".trace.json")),
+      playwrightTraces: (report.evidenceRefs.playwrightTraces || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(runId, ref, ".playwright-trace.zip")),
+      locatorRepairs: (report.evidenceRefs.locatorRepairs || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(runId, ref, ".locator-repair.json")),
+      exports: (report.evidenceRefs.exports || []).filter((ref) => this.runtimeStore.isEvidenceArtifactForRun(runId, ref, ".spec.ts")),
+    };
+    return {
+      ...storeRefs,
+      screenshots: uniqValues([...(storeRefs.screenshots || []), ...reportEvidenceRefs.screenshots]),
+      accessibility: uniqValues([...(storeRefs.accessibility || []), ...reportEvidenceRefs.accessibility]),
+      actionTraces: uniqValues([...(storeRefs.actionTraces || []), ...reportEvidenceRefs.actionTraces]),
+      playwrightTraces: uniqValues([...(storeRefs.playwrightTraces || []), ...reportEvidenceRefs.playwrightTraces]),
+      locatorRepairs: uniqValues([...(storeRefs.locatorRepairs || []), ...reportEvidenceRefs.locatorRepairs]),
+      exports: uniqValues([...(storeRefs.exports || []), ...reportEvidenceRefs.exports]),
+      evidenceCapsule: storeRefs.evidenceCapsule || report.evidenceRefs.evidenceCapsule,
+    };
+  }
+
+  getEvidenceCapsule(runId: string): EvidenceCapsule | null {
+    const stored = this.runtimeStore.getEvidenceCapsule(runId);
+    if (stored) return stored;
+    const report = this.getBlackboxReport(runId);
+    return report ? this.createEvidenceCapsule(report) : null;
+  }
+
+  readEvidenceArtifactRef(runId: string, ref: string) {
+    const allowedRefs = new Set<string>();
+    const addRef = (value: unknown) => {
+      if (typeof value === "string" && value.trim()) allowedRefs.add(path.resolve(value));
+    };
+    const addRefs = (value: unknown) => {
+      if (Array.isArray(value)) value.forEach(addRef);
+    };
+    const refs = this.getEvidenceRefs(runId);
+    addRef(refs.run);
+    addRefs(refs.steps);
+    addRefs(refs.events);
+    addRef(refs.scenarioReport);
+    addRef(refs.blackboxPlan);
+    addRef(refs.blackboxReport);
+    addRefs(refs.screenshots);
+    addRefs(refs.accessibility);
+    addRefs(refs.actionTraces);
+    addRefs(refs.playwrightTraces);
+    addRefs(refs.locatorRepairs);
+    addRef(refs.evidenceCapsule);
+    addRefs(refs.exports);
+    if (!allowedRefs.has(path.resolve(ref))) return null;
+    return this.runtimeStore.readArtifactRef(ref);
+  }
+
+  createHarnessVerificationReport(input: {
+    target?: SupportedTarget;
+    driver?: string;
+    goals?: string[];
+    blackboxRunId?: string;
+    targetProject?: Record<string, unknown>;
+    regressionSeedRef?: string;
+    executionContext?: Record<string, unknown>;
+  }): HarnessVerificationReport | null {
+    const target = input.target === "miniapp" ? "miniapp" : "web";
+    const blackboxRunId = String(input.blackboxRunId || "");
+    const blackboxReport = blackboxRunId ? this.getBlackboxReport(blackboxRunId) : null;
+    if (!blackboxReport) return null;
+    const targetProject = input.targetProject && Object.keys(input.targetProject).length > 0 ? input.targetProject : blackboxReport.targetProject;
+    const targetValidation = validateTargetProject(targetProject, target);
+    const targetMatchesBlackbox = blackboxReport.target === target;
+    const projectRootMatches = (left: unknown, right: unknown): boolean => {
+      const leftValue = typeof left === "string" ? left.trim() : "";
+      const rightValue = typeof right === "string" ? right.trim() : "";
+      return Boolean(leftValue && rightValue && path.resolve(leftValue) === path.resolve(rightValue));
+    };
+    const targetUrlMatches = (left: unknown, right: unknown): boolean => {
+      const leftValue = typeof left === "string" ? left.trim() : "";
+      const rightValue = typeof right === "string" ? right.trim() : "";
+      return target !== "web" || Boolean(leftValue && rightValue && leftValue === rightValue);
+    };
+    const blackboxTargetProject = blackboxReport.targetProject || {};
+    const targetProjectMatchesBlackbox =
+      projectRootMatches(targetProject.workspaceRoot, blackboxTargetProject.workspaceRoot) &&
+      projectRootMatches(targetProject.resolvedProjectRoot, blackboxTargetProject.resolvedProjectRoot) &&
+      targetUrlMatches(targetProject.targetUrl, blackboxTargetProject.targetUrl);
+    const evidenceRefs = this.getEvidenceRefs(blackboxReport.runId);
+    const flattenedRefs = this.flattenEvidenceRefs(evidenceRefs);
+    const evidenceRefsValid = flattenedRefs.every((ref) => Boolean(this.readEvidenceArtifactRef(blackboxReport.runId, ref)));
+    const passedCases = blackboxReport.blackboxGate?.blockingPassedCases || blackboxReport.cases.filter((testCase) => testCase.status === "passed").map((testCase) => testCase.caseId);
+    const failedCases = blackboxReport.blackboxGate?.blockingFailedCases || blackboxReport.cases.filter((testCase) => testCase.status === "failed").map((testCase) => testCase.caseId);
+    const manualReviewCases = blackboxReport.cases.filter((testCase) => testCase.status === "manual_review_required").map((testCase) => testCase.caseId);
+    const runtimeBlockingItems = blackboxReport.blackboxGate?.runtimeBlockingItems || [];
+    let regressionSeedRef = input.regressionSeedRef || "";
+    const needsRegression = failedCases.length > 0 || manualReviewCases.length > 0 || runtimeBlockingItems.length > 0 || blackboxReport.blackboxGate?.passed === false;
+    if (needsRegression && !regressionSeedRef) {
+      const seed = this.seedRegressionFromRun(blackboxReport.runId);
+      regressionSeedRef = seed?.filePath || "";
+    }
+    const validDriver = input.driver === "playwright" || input.driver === "computer-use" || input.driver === "devtools-automator";
+    const executionContext = input.executionContext || {};
+    const profileIsolation = typeof executionContext.profileIsolation === "string" ? executionContext.profileIsolation : "";
+    const driverMode = typeof executionContext.driverMode === "string" ? executionContext.driverMode : "";
+    const miniappProfileIsolated =
+      target !== "miniapp" ||
+      input.driver !== "devtools-automator" ||
+      driverMode === "driverModule" ||
+      profileIsolation === "verified";
+    const checks = {
+      targetProjectResolved: targetValidation.ok,
+      targetMatchesBlackbox,
+      targetProjectMatchesBlackbox,
+      environmentStarted:
+        target === "web"
+          ? targetValidation.ok && targetProjectMatchesBlackbox && Boolean(String(targetProject.targetUrl || ""))
+          : targetValidation.ok && targetProjectMatchesBlackbox && blackboxReport.cases.length > 0,
+      driverAvailable: validDriver,
+      blackboxBlockingPass: passedCases.length > 0,
+      noBlackboxFailures: failedCases.length === 0,
+      noManualReview: manualReviewCases.length === 0,
+      noBlockingRuntimeFailure: runtimeBlockingItems.length === 0,
+      evidenceRefsValid,
+      regressionSeededWhenFailed: !needsRegression || Boolean(regressionSeedRef),
+      miniappProfileIsolated,
+    };
+    const gate = evaluateHarnessGate(checks, { failedCases, manualReviewCases, runtimeBlockingItems });
+    const harnessRunId = `harness-${this.createCheckpoint()}`;
+    const traceRefs = evidenceRefs.actionTraces || [];
+    const userActionRequest = executionContext.userActionRequest && typeof executionContext.userActionRequest === "object"
+      ? executionContext.userActionRequest as HarnessVerificationReport["forExecutingAI"]["userActionRequest"]
+      : undefined;
+    const automationAttempts = Array.isArray(executionContext.automationAttempts) ? executionContext.automationAttempts.map(String) : [];
+    const retryCommand = typeof executionContext.retryCommand === "string" ? executionContext.retryCommand : undefined;
+    const report: HarnessVerificationReport = {
+      harnessRunId,
+      target,
+      targetProject,
+      driver: (input.driver === "computer-use" || input.driver === "devtools-automator" || input.driver === "playwright" ? input.driver : target === "miniapp" ? "devtools-automator" : "playwright"),
+      goals: (input.goals || []).map(String).filter(Boolean),
+      linkedRunIds: [blackboxReport.runId],
+      blackboxRunId: blackboxReport.runId,
+      planId: blackboxReport.planId,
+      blackboxGate: blackboxReport.blackboxGate,
+      releaseDecision: blackboxReport.releaseDecision,
+      gate,
+      evidenceRefs,
+      evidenceIndexRef: "",
+      evidenceCapsuleRef: evidenceRefs.evidenceCapsule || blackboxReport.forExecutingAI.evidenceCapsuleRef,
+      regressionSeedRef,
+      forExecutingAI: {
+        status: gate.status,
+        gateDecision: gate.status === "pass" ? "目标项目已通过 harness 外部验证。" : "目标项目验证未放行，执行 AI 不能声称完成。",
+        verifiedUserFlows: blackboxReport.forExecutingAI.validatedUserFlows || blackboxReport.forExecutingAI.verifiedGoals || [],
+        blockedUserFlows: blackboxReport.forExecutingAI.blockedUserFlows || blackboxReport.cases.filter((testCase) => testCase.status !== "passed").map((testCase) => testCase.userGoal),
+        whatWasActuallySeen: blackboxReport.visibleEvidence.slice(0, 10),
+        runtimeClues: blackboxReport.runtimeEvidence.slice(0, 10),
+        nextAction:
+          gate.status === "pass"
+            ? "可以把 harness 报告和 evidence capsule 交给执行 AI 进入 handoff。"
+            : regressionSeedRef
+              ? "先修复阻塞用户流或 runtime failure，再用 regression candidate 重跑 harness。"
+              : "先补齐真实目标项目、driver 或证据链，再重跑 harness。",
+        evidenceCapsuleRef: evidenceRefs.evidenceCapsule || blackboxReport.forExecutingAI.evidenceCapsuleRef,
+        traceRefs,
+        regressionRefs: regressionSeedRef ? [regressionSeedRef] : [],
+        userActionRequest,
+        automationAttempts,
+        retryCommand,
+      },
+      createdAt: nowIso(),
+    };
+    const evidenceIndexRefs = [
+      ...this.flattenEvidenceRefs(evidenceRefs),
+      report.evidenceCapsuleRef || "",
+      regressionSeedRef,
+    ].filter(Boolean);
+    const evidenceIndex = {
+      harnessRunId,
+      blackboxRunId: blackboxReport.runId,
+      planId: blackboxReport.planId,
+      refs: evidenceIndexRefs,
+      evidenceCapsuleRef: report.evidenceCapsuleRef || "",
+      regressionSeedRef,
+      artifactManifestRef: "",
+      generatedAt: report.createdAt,
+    };
+    report.evidenceIndexRef = this.runtimeStore.saveEvidenceArtifact(harnessRunId, "harness-evidence-index", "json", `${JSON.stringify(evidenceIndex, null, 2)}\n`);
+    const manifestRefs = [...evidenceIndexRefs, report.evidenceIndexRef].filter(Boolean);
+    const manifest = this.runtimeStore.artifactManifestForHarnessRun(harnessRunId, manifestRefs);
+    const manifestRef = manifest.entries.find((entry) => entry.ref.endsWith("artifact-manifest.json"))?.ref || "";
+    report.artifactManifestRef = manifestRef;
+    const finalizedEvidenceIndex = {
+      ...evidenceIndex,
+      refs: [...manifestRefs, manifestRef].filter(Boolean),
+      artifactManifestRef: manifestRef,
+    };
+    report.evidenceIndexRef = this.runtimeStore.saveEvidenceArtifact(harnessRunId, "harness-evidence-index", "json", `${JSON.stringify(finalizedEvidenceIndex, null, 2)}\n`);
+    const run: HarnessRun = {
+      harnessRunId,
+      target,
+      targetProject,
+      driver: report.driver,
+      goals: report.goals,
+      linkedRunIds: report.linkedRunIds,
+      blackboxRunId: blackboxReport.runId,
+      planId: blackboxReport.planId,
+      evidenceRefs,
+      evidenceIndexRef: report.evidenceIndexRef,
+      artifactManifestRef: report.artifactManifestRef,
+      evidenceCapsuleRef: report.evidenceCapsuleRef,
+      regressionSeedRef,
+      createdAt: report.createdAt,
+    };
+    this.runtimeStore.saveHarnessRun(run);
+    this.runtimeStore.saveHarnessReport(report);
+    this.harnessReports.set(harnessRunId, report);
+    return report;
+  }
+
+  getHarnessVerificationReport(harnessRunId: string): HarnessVerificationReport | null {
+    return this.harnessReports.get(harnessRunId) || this.runtimeStore.getHarnessReport(harnessRunId);
+  }
+
+  readHarnessEvidenceArtifactRef(harnessRunId: string, ref: string) {
+    const report = this.getHarnessVerificationReport(harnessRunId);
+    if (!report) return null;
+    const allowedRefs = new Set(this.flattenEvidenceRefs(report.evidenceRefs).map((item) => path.resolve(item)));
+    if (report.evidenceIndexRef) allowedRefs.add(path.resolve(report.evidenceIndexRef));
+    if (report.artifactManifestRef) allowedRefs.add(path.resolve(report.artifactManifestRef));
+    if (report.evidenceCapsuleRef) allowedRefs.add(path.resolve(report.evidenceCapsuleRef));
+    if (report.regressionSeedRef) allowedRefs.add(path.resolve(report.regressionSeedRef));
+    const manifest = this.runtimeStore.inspect({
+      harnessRunId,
+      refs: [...this.flattenEvidenceRefs(report.evidenceRefs), report.evidenceIndexRef, report.artifactManifestRef || "", report.evidenceCapsuleRef || "", report.regressionSeedRef || ""].filter(Boolean),
+    });
+    for (const entry of manifest.entries) allowedRefs.add(path.resolve(entry.ref));
+    if (!allowedRefs.has(path.resolve(ref))) return null;
+    return this.runtimeStore.readArtifactRef(ref);
+  }
+
+  inspectRuntimeStore(input: { runId?: string; harnessRunId?: string }) {
+    const report = input.harnessRunId ? this.getHarnessVerificationReport(input.harnessRunId) : null;
+    return this.runtimeStore.inspect({
+      runId: input.runId,
+      harnessRunId: input.harnessRunId,
+      refs: report ? [...this.flattenEvidenceRefs(report.evidenceRefs), report.evidenceIndexRef, report.artifactManifestRef || "", report.evidenceCapsuleRef || "", report.regressionSeedRef || ""].filter(Boolean) : [],
+    });
+  }
+
+  cleanupRuntimeStore(input: { olderThanDays: number; dryRun?: boolean; confirm?: boolean }) {
+    return this.runtimeStore.cleanup(input);
+  }
+
+  private flattenEvidenceRefs(refs: EvidenceRefs): string[] {
+    const values: string[] = [];
+    const add = (value: unknown) => {
+      if (typeof value === "string" && value.trim()) values.push(value);
+    };
+    const addMany = (value: unknown) => {
+      if (Array.isArray(value)) value.forEach(add);
+    };
+    add(refs.run);
+    addMany(refs.steps);
+    addMany(refs.events);
+    add(refs.scenarioReport);
+    add(refs.blackboxPlan);
+    add(refs.blackboxReport);
+    addMany(refs.screenshots);
+    addMany(refs.accessibility);
+    addMany(refs.actionTraces);
+    addMany(refs.playwrightTraces);
+    addMany(refs.locatorRepairs);
+    add(refs.evidenceCapsule);
+    addMany(refs.exports);
+    return uniqValues(values);
+  }
+
+  seedRegressionFromRun(runId: string) {
+    const report = this.getBlackboxReport(runId);
+    if (!report) return null;
+    const artifact = {
+      runId,
+      planId: report.planId,
+      generatedAt: nowIso(),
+      candidates: report.cases
+        .filter((testCase) => testCase.status === "failed" || testCase.status === "manual_review_required")
+        .map((testCase) => ({
+          id: `regression_${testCase.caseId}`,
+          caseId: testCase.caseId,
+          userGoal: testCase.userGoal,
+          failureReason: testCase.failureReason || testCase.status,
+          visibleEvidence: testCase.visibleEvidence.slice(0, 5),
+          runtimeEvidence: testCase.runtimeEvidence.slice(0, 5),
+        })),
+      runtimeFailures: this.blackboxRuntimeBlockingItems(report.runtimeEvidence),
+      locatorRepairRefs: report.locatorRepairRefs || [],
+    };
+    const filePath = this.runtimeStore.saveEvidenceArtifact(runId, "regression-candidates", "json", `${JSON.stringify(artifact, null, 2)}\n`);
+    return { ...artifact, filePath };
+  }
+
+  saveBenchmarkReport(report: BenchmarkRunReport): BenchmarkRunReport {
+    this.runtimeStore.saveBenchmarkReport(report);
+    return report;
+  }
+
+  saveRunEvidenceArtifact(runId: string, name: string, extension: string, body: string | Buffer): string {
+    return this.runtimeStore.saveEvidenceArtifact(runId, name, extension, body);
+  }
+
+  getBlackboxActionTraces(runId: string): BlackboxActionTrace[] {
+    const stored = this.runtimeStore.listBlackboxActionTraces(runId);
+    if (stored.length > 0) return stored;
+    return this.events
+      .listByRun(runId)
+      .filter((event) => event.tags.includes("blackbox_action_trace") && event.context?.actionTrace)
+      .map((event) => event.context.actionTrace as BlackboxActionTrace)
+      .filter((trace) => Boolean(trace && trace.runId === runId));
+  }
+
+  exportBlackboxRun(runId: string, format: "playwright" = "playwright"): BlackboxExportArtifact | null {
+    const report = this.getBlackboxReport(runId);
+    if (!report || format !== "playwright") return null;
+    const plan = this.getBlackboxPlan(report.planId);
+    if (!plan || report.target !== "web") return null;
+    const passedCaseIds = new Set(report.cases.filter((testCase) => testCase.status === "passed").map((testCase) => testCase.caseId));
+    const skippedCases = report.cases.filter((testCase) => testCase.status !== "passed").map((testCase) => testCase.caseId);
+    const manualReviewCases = report.cases.filter((testCase) => testCase.status === "manual_review_required").map((testCase) => testCase.caseId);
+    const targetUrl = String(report.targetProject.targetUrl || plan.targetProject.targetUrl || "");
+    const lines: string[] = [
+      "import { test, expect } from '@playwright/test';",
+      "",
+      `// Generated by Dev Log Relay blackbox export.`,
+      `// planId:${report.planId} runId:${report.runId}`,
+      `const targetUrl = ${JSON.stringify(targetUrl)};`,
+      "",
+    ];
+    for (const testCase of plan.cases.filter((item) => passedCaseIds.has(item.id))) {
+      lines.push(`test(${JSON.stringify(testCase.userGoal)}, async ({ page }) => {`);
+      lines.push(`  // caseId:${testCase.id}`);
+      lines.push("  await page.goto(targetUrl);");
+      for (const step of testCase.steps) {
+        if (step.action === "open") {
+          lines.push(`  await page.goto(new URL(${JSON.stringify(step.route || "/")}, targetUrl).toString());`);
+        } else if (step.action === "wait_visible" || step.action === "observe") {
+          const locator = this.playwrightLocatorExpression(step.locator, step.selector || "body");
+          lines.push(`  await expect(${locator}).toBeVisible();`);
+        } else if (step.action === "fill") {
+          const locator = this.playwrightLocatorExpression(step.locator, step.selector || "input,textarea");
+          lines.push(`  await ${locator}.fill(${JSON.stringify(step.value || step.text || "test")});`);
+        } else if (step.action === "press") {
+          lines.push(`  await page.keyboard.press(${JSON.stringify(step.value || "Enter")});`);
+        } else if (step.action === "click") {
+          const locator = this.playwrightLocatorExpression(step.locator, step.selector || "a,button,[role=button]");
+          lines.push(`  await ${locator}.click();`);
+        }
+      }
+      lines.push("  await expect(page.locator('body')).toBeVisible();");
+      lines.push("});");
+      lines.push("");
+    }
+    if (skippedCases.length > 0) {
+      lines.push(`// Not exported as executable passing tests: ${skippedCases.join(", ")}`);
+      if (manualReviewCases.length > 0) {
+        lines.push(`// TODO manual review required before export: ${manualReviewCases.join(", ")}`);
+      }
+    }
+    const content = `${lines.join("\n").trimEnd()}\n`;
+    const artifact: BlackboxExportArtifact = {
+      runId: report.runId,
+      planId: report.planId,
+      format,
+      filePath: "",
+      content,
+      exportedCases: Array.from(passedCaseIds),
+      skippedCases,
+      generatedAt: nowIso(),
+    };
+    const filePath = this.runtimeStore.saveBlackboxExport(artifact);
+    const stored = { ...artifact, filePath };
+    const updatedReport: BlackboxRunReport = {
+      ...report,
+      evidenceRefs: this.runtimeStore.evidenceRefsFor(report.runId, report.planId),
+      forExecutingAI: {
+        ...report.forExecutingAI,
+        exportRef: filePath,
+      },
+    };
+    this.blackboxReports.set(report.runId, updatedReport);
+    this.runtimeStore.saveBlackboxReport(updatedReport);
+    return stored;
   }
 
   getScenarioTemplate(templateName: string, target?: SupportedTarget): ScenarioSpec | null {
@@ -1164,6 +2135,7 @@ export class RelayEngine {
     };
     this.scenarioReports.set(runId, report);
     this.scenarioSpecs.set(spec.id, spec);
+    this.runtimeStore.saveScenarioReport(runId, report);
     this.captureDerivedRunFacts(runId);
     return report;
   }
@@ -1430,7 +2402,7 @@ export class RelayEngine {
     const normalizedTarget = (target === "miniapp" ? "miniapp" : "web") as SupportedTarget;
     if (normalizedTarget === "miniapp") {
       const miniappDriver = (
-        driver === "devtools-automator" || driver === "external-agent" || driver === "generic-miniapp-driver"
+        driver === "devtools-automator" || driver === "computer-use" || driver === "external-agent" || driver === "generic-miniapp-driver"
           ? driver
           : "external-agent"
       ) as MiniappDriverType;
@@ -1438,7 +2410,7 @@ export class RelayEngine {
         target: "miniapp",
         driver: miniappDriver,
         positioning: miniappDriver === "devtools-automator" ? "reference_driver" : "external_agent_driver",
-        executable: miniappDriver === "devtools-automator",
+        executable: miniappDriver !== "external-agent",
         requiredOrder: [
           "doctor target",
           "project verify",
@@ -2607,6 +3579,7 @@ export class RelayEngine {
     const scenario = this.getScenarioReport(runId);
     const driverCheck = this.getDriverContractCompliance(runId);
     const actions = this.getRunActions(runId);
+    const blackboxReport = this.blackboxReports.get(runId) || null;
     const regression = report.closure?.baselineRunId ? this.getRegressionDiff(report.closure.baselineRunId, runId, scenario?.scenarioId) : null;
     const blockingItems: string[] = [];
     const nonBlockingItems: string[] = [];
@@ -2636,9 +3609,10 @@ export class RelayEngine {
     if (report.closure?.decision.status === "unresolved" || report.closure?.decision.status === "regressed") {
       blockingItems.push(`closure:${report.closure.decision.status}`);
     }
-    if (scenario?.blocking && scenario.status !== "passed") {
+    const blackboxScenarioId = blackboxReport ? `${blackboxReport.planId}_suite` : "";
+    if (scenario?.blocking && scenario.status !== "passed" && scenario.scenarioId !== blackboxScenarioId) {
       blockingItems.push(`scenario:${scenario.scenarioId}:${scenario.status}`);
-    } else if (scenario && scenario.status !== "passed") {
+    } else if (scenario && scenario.status !== "passed" && scenario.scenarioId !== blackboxScenarioId) {
       nonBlockingItems.push(`scenario:${scenario.scenarioId}:${scenario.status}`);
     }
     if (report.closure?.hasRegression) {
@@ -2653,6 +3627,35 @@ export class RelayEngine {
     if (run?.target === "miniapp" && !scenario) {
       nonBlockingItems.push("scenario_not_executed");
     }
+    if (run?.metadata?.blackbox && !blackboxReport) {
+      blockingItems.push("blackbox_blocking_pass_required");
+    }
+    if (blackboxReport) {
+      const passedCases = blackboxReport.cases.filter((testCase) => testCase.status === "passed").map((testCase) => testCase.caseId);
+      const failedCases = blackboxReport.cases.filter((testCase) => testCase.status === "failed").map((testCase) => testCase.caseId);
+      const manualReviewCases = blackboxReport.cases.filter((testCase) => testCase.status === "manual_review_required").map((testCase) => testCase.caseId);
+      if (passedCases.length === 0) {
+        blockingItems.push("blackbox_blocking_pass_required");
+      }
+      if (failedCases.length > 0) {
+        blockingItems.push(...failedCases.map((caseId) => `blackbox:${caseId}:failed`));
+      }
+      if (manualReviewCases.length > 0) {
+        blockingItems.push(...manualReviewCases.map((caseId) => `blackbox:${caseId}:manual_review_required`));
+      }
+      if ((blackboxReport.qualitySignals || []).some((signal) => signal.severity === "blocking")) {
+        blockingItems.push(...(blackboxReport.qualitySignals || []).filter((signal) => signal.severity === "blocking").map((signal) => signal.kind));
+      }
+    }
+    const blackboxFields = blackboxReport
+      ? {
+          blackboxGate: blackboxReport.blackboxGate,
+          blackboxRunId: blackboxReport.runId,
+          blackboxPassedCases: blackboxReport.cases.filter((testCase) => testCase.status === "passed").map((testCase) => testCase.caseId),
+          blackboxFailedCases: blackboxReport.cases.filter((testCase) => testCase.status === "failed").map((testCase) => testCase.caseId),
+          blackboxEvidenceRefs: blackboxReport.evidenceRefs,
+        }
+      : {};
     if (report.closure?.decision.status === "resolved" && blockingItems.length === 0 && report.runtimeReadiness?.evidenceLayer === "user_flow_closed") {
       return {
         decision: "ship",
@@ -2664,6 +3667,7 @@ export class RelayEngine {
         why: ["resolved_closure", "user_flow_closed", "no_blocking_scenario_failure"],
         baselineRefs,
         blockingScenarioIds,
+        ...blackboxFields,
       };
     }
     if (blockingItems.length > 0) {
@@ -2677,6 +3681,7 @@ export class RelayEngine {
         why: blockingItems,
         baselineRefs,
         blockingScenarioIds,
+        ...blackboxFields,
       };
     }
     return {
@@ -2689,6 +3694,7 @@ export class RelayEngine {
       why: ["runtime_observed_without_closed_flow"],
       baselineRefs,
       blockingScenarioIds,
+      ...blackboxFields,
     };
   }
 
@@ -3141,6 +4147,7 @@ export class RelayEngine {
     const batch = this.queue.dequeueBatch(500);
     for (const event of batch) {
       this.events.push(event);
+      this.runtimeStore.saveEvent(event);
       if (event.level === "warn" || event.level === "error") this.incidents.upsert(event);
     }
   }
@@ -3446,7 +4453,91 @@ export class RelayEngine {
   }
 
   private resolveBaselineRunId(runId: string): string {
-    return this.orchestrations.getSession(runId)?.baselineRunId || this.runs.previousCompletedRunId(runId);
+    const run = this.runs.getRun(runId);
+    const orchestrationBaseline = this.orchestrations.getSession(runId)?.baselineRunId || "";
+    const explicitBaseline = typeof run?.metadata.baselineRunId === "string" ? String(run.metadata.baselineRunId) : "";
+    if (orchestrationBaseline) return orchestrationBaseline;
+    if (explicitBaseline) return explicitBaseline;
+    if (run?.metadata.blackbox) return "";
+    return this.runs.previousCompletedRunId(runId);
+  }
+
+  private classifyBlackboxFailures(report: BlackboxRunReport, runtimeBlockingItems: string[]): BlackboxFailureCategory[] {
+    const categories = new Set<BlackboxFailureCategory>();
+    if (runtimeBlockingItems.length > 0 || report.runtimeEvidence.some((item) => /error|failure|exception|500/i.test(item))) {
+      categories.add("app_runtime_failure");
+    }
+    for (const testCase of report.cases) {
+      const reason = `${testCase.failureReason || ""} ${testCase.runtimeEvidence.join(" ")}`.toLowerCase();
+      if (testCase.status === "failed") categories.add("visible_assertion_failed");
+      if (/locator|selector|strict mode|not visible|timeout|waiting/i.test(reason)) categories.add("locator_unstable");
+      if (/auth|login|permission|forbidden|unauthorized|401|403|权限|登录/i.test(reason)) categories.add("auth_or_permission_required");
+      if (/network|fetch|request|response|timeout|api|数据|empty|no data/i.test(reason)) categories.add("network_or_data_dependency");
+      if (/ledger|driver|nonce|visible_evidence_required|action_ledger_required/i.test(reason)) categories.add("driver_or_ledger_invalid");
+    }
+    return Array.from(categories);
+  }
+
+  private blackboxRuntimeBlockingItems(runtimeEvidence: string[]): string[] {
+    return uniqValues(
+      runtimeEvidence
+        .filter((item) => /network:(4\d\d|5\d\d)|console:error|error|failure|exception|uncaught|not found|unauthorized|forbidden|401|403|404|500/i.test(item))
+        .map((item) => `runtime:${item}`.slice(0, 180))
+    );
+  }
+
+  private blackboxCoverageGaps(plan: BlackboxPlan, report: BlackboxRunReport): string[] {
+    const gaps: string[] = [];
+    const skipped = report.cases.filter((testCase) => testCase.status === "skipped").map((testCase) => testCase.caseId);
+    const manual = report.cases.filter((testCase) => testCase.status === "manual_review_required").map((testCase) => testCase.caseId);
+    if (skipped.length > 0) gaps.push(`skipped_cases:${skipped.join(",")}`);
+    if (manual.length > 0) gaps.push(`manual_review_cases:${manual.join(",")}`);
+    if (!plan.discoverSummary?.actionCandidates?.length && plan.target === "web") gaps.push("no_observe_action_candidates");
+    if (plan.skippedCandidates.length > 0) gaps.push(...plan.skippedCandidates.slice(0, 5));
+    return gaps;
+  }
+
+  private createEvidenceCapsule(report: BlackboxRunReport): EvidenceCapsule {
+    const evidenceRefs = this.runtimeStore.evidenceRefsFor(report.runId, report.planId);
+    const failedCases = report.cases.filter((testCase) => testCase.status === "failed").map((testCase) => testCase.caseId);
+    const manualReviewCases = report.cases.filter((testCase) => testCase.status === "manual_review_required").map((testCase) => testCase.caseId);
+    const failureTaxonomy = report.forExecutingAI.failureTaxonomy || this.classifyBlackboxFailures(report, report.blackboxGate?.runtimeBlockingItems || []);
+    const status =
+      report.blackboxGate?.passed
+        ? "passed"
+        : manualReviewCases.length > 0
+          ? "manual_review_required"
+          : failedCases.length > 0 || report.failed > 0
+            ? "failed"
+            : report.releaseDecision?.decision === "hold"
+              ? "hold"
+              : "unknown";
+    return {
+      runId: report.runId,
+      planId: report.planId,
+      target: report.target,
+      status,
+      summary: `blackbox ${status}: ${report.passed} passed, ${report.failed} failed, ${manualReviewCases.length} manual review`,
+      verifiedGoals: report.forExecutingAI.verifiedGoals || [],
+      failedCases,
+      manualReviewCases,
+      failureTaxonomy,
+      visibleTextSummary: report.visibleEvidence.slice(0, 5).map((item) => item.slice(0, 240)),
+      runtimeClues: report.runtimeEvidence.slice(0, 10).map((item) => item.slice(0, 240)),
+      qualitySignals: report.qualitySignals || [],
+      evidenceRefs,
+      generatedAt: nowIso(),
+    };
+  }
+
+  private playwrightLocatorExpression(locator: BlackboxLocatorCandidate | undefined, fallbackSelector: string): string {
+    if (!locator) return `page.locator(${JSON.stringify(fallbackSelector)}).first()`;
+    if (locator.strategy === "testid") return `page.getByTestId(${JSON.stringify(locator.value)}).first()`;
+    if (locator.strategy === "role") return `page.getByRole(${JSON.stringify(locator.value)}${locator.name ? `, { name: ${JSON.stringify(locator.name)} }` : ""}).first()`;
+    if (locator.strategy === "label") return `page.getByLabel(${JSON.stringify(locator.value)}).first()`;
+    if (locator.strategy === "placeholder") return `page.getByPlaceholder(${JSON.stringify(locator.value)}).first()`;
+    if (locator.strategy === "text") return `page.getByText(${JSON.stringify(locator.value)}).first()`;
+    return `page.locator(${JSON.stringify(locator.selector || locator.value || fallbackSelector)}).first()`;
   }
 
   private hasNoProgress(sessionId: string): boolean {
@@ -3664,14 +4755,13 @@ export class RelayEngine {
     this.baselineRegistry.set(key, next);
   }
 
-  private async loadProjectScenarios(): Promise<void> {
+  private loadProjectScenarios(): void {
     const root = process.env.DEV_LOG_RELAY_WORKSPACE_ROOT ? path.resolve(process.env.DEV_LOG_RELAY_WORKSPACE_ROOT) : this.workspaceRoot;
     const scenarioDir = path.join(root, "tooling", "scenarios");
     try {
-      const { readdir, readFile } = await import("node:fs/promises");
-      const files = await readdir(scenarioDir);
+      const files = readdirSync(scenarioDir);
       for (const file of files.filter((item) => item.endsWith(".json"))) {
-        const raw = await readFile(path.join(scenarioDir, file), "utf8");
+        const raw = readFileSync(path.join(scenarioDir, file), "utf8");
         const spec = JSON.parse(raw) as ScenarioSpec;
         if (spec && spec.id && (spec.target === "web" || spec.target === "miniapp")) {
           this.scenarioSpecs.set(spec.id, spec);
@@ -3688,15 +4778,14 @@ export class RelayEngine {
     }
   }
 
-  private async loadProjectBaselines(): Promise<void> {
+  private loadProjectBaselines(): void {
     const root = process.env.DEV_LOG_RELAY_WORKSPACE_ROOT ? path.resolve(process.env.DEV_LOG_RELAY_WORKSPACE_ROOT) : this.workspaceRoot;
     const baselineDir = path.join(root, "tooling", "baselines");
     try {
-      const { readdir, readFile } = await import("node:fs/promises");
-      const files = await readdir(baselineDir);
+      const files = readdirSync(baselineDir);
       for (const file of files.filter((item) => item.endsWith(".json"))) {
         const absolute = path.join(baselineDir, file);
-        const raw = await readFile(absolute, "utf8");
+        const raw = readFileSync(absolute, "utf8");
         const snapshot = JSON.parse(raw) as ScenarioBaselineSnapshot;
         if (snapshot && snapshot.scenarioId) {
           this.registerBaselineSnapshot(snapshot, snapshot.evidenceLayer === "user_flow_closed", "project_local", absolute);

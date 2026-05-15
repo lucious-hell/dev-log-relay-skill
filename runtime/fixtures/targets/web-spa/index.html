@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+  <head><title>Fixture SPA</title></head>
+  <body>
+    <nav>
+      <a data-testid="nav-products" href="/products">Products</a>
+      <a href="/settings">Account settings</a>
+    </nav>
+    <main>
+      <section class="toolbar">
+        <input aria-label="Search products" placeholder="Search" />
+        <button data-testid="filter-available">Filter available</button>
+      </section>
+      <section role="list">
+        <article><a href="/products/1">Alpha detail</a></article>
+      </section>
+      <dialog open aria-label="Welcome modal"><button>Close</button></dialog>
+      <div role="status">Loaded</div>
+      <button>Delete account</button>
+    </main>
+  </body>
+</html>

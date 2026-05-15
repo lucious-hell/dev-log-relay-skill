@@ -18,6 +18,10 @@ interface MiniappExecutionCoordinatorInput {
   scenario: ScenarioSpec;
   projectRoot: string;
   driverModule?: string;
+  cliPath?: string;
+  servicePort?: string;
+  projectPath?: string;
+  profileDir?: string;
   projectCheck?: MiniappProjectIntegrationReport | null;
 }
 
@@ -46,6 +50,7 @@ export class MiniappExecutionCoordinator {
       fs.existsSync(input.projectRoot) ? "project_root_exists" : "project_root_missing",
       input.projectCheck?.blockingIssues?.length ? "project_check_blocking_issues" : "project_check_ready",
       input.driverModule ? "driver_module_configured" : "driver_module_not_configured",
+      input.servicePort ? "service_port_configured" : "service_port_not_configured",
       input.scenario.actions?.length ? "scenario_actions_declared" : "scenario_actions_inferred",
     ];
     const driverResolution: DriverResolutionReport = {
@@ -98,6 +103,10 @@ export class MiniappExecutionCoordinator {
       runId: input.runId,
       projectRoot: input.projectRoot,
       driverModule: input.driverModule,
+      cliPath: input.cliPath,
+      servicePort: input.servicePort,
+      projectPath: input.projectPath,
+      profileDir: input.profileDir,
     });
 
     const actionResults = execution.actionResults.map((item) => ({

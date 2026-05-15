@@ -28,7 +28,7 @@ export type IntegrationMaturity = "none" | "basic" | "preferred" | "strong";
 export type EvidenceSource = "runtime_relay" | "ui_fallback" | "project_inspection";
 export type WebFramework = "react-vite" | "vue-vite" | "nextjs" | "taro-h5" | "uniapp-h5" | "generic-web" | "unknown";
 export type ExternalDriverType = "playwright" | "computer-use" | "ide-agent" | "generic-browser-agent";
-export type MiniappDriverType = "devtools-automator" | "external-agent" | "generic-miniapp-driver";
+export type MiniappDriverType = "devtools-automator" | "computer-use" | "external-agent" | "generic-miniapp-driver";
 export type ClosureVerdictStatus = "resolved" | "unresolved" | "inconclusive" | "unsupported" | "integration_required";
 export type EvidenceLayer = "project_structure" | "instrumentation_attached" | "runtime_events_observed" | "user_flow_closed";
 export type TargetDetectionStatus = "detected_supported" | "detected_partial" | "unknown_but_observable" | "unsupported" | "inapplicable";
@@ -59,7 +59,15 @@ export type FailureReasonCode =
   | "driver_contract_failed"
   | "unsupported_target"
   | "inapplicable_runtime"
-  | "low_confidence";
+  | "low_confidence"
+  | "harness_target_unresolved"
+  | "harness_environment_start_failed"
+  | "harness_driver_unavailable"
+  | "harness_blackbox_required"
+  | "harness_evidence_invalid"
+  | "harness_regression_seed_failed"
+  | "harness_target_mismatch"
+  | "harness_gate_hold";
 export type ScenarioObservationStatus = "passed" | "failed" | "partially_observed" | "not_observed";
 export type ScenarioAssertionStatus = "passed" | "failed" | "not_observed";
 export type ScenarioRiskLevel = "low" | "medium" | "high" | "critical";
@@ -82,6 +90,588 @@ export type MiniappExecutionStopReason =
   | "scenario_validation_failed"
   | "closure_hold"
   | "completed";
+export type BlackboxTarget = SupportedTarget;
+export type BlackboxDriver = "playwright" | "computer-use" | "devtools-automator";
+export type BlackboxCaseSource = "heuristic" | "goal" | "project_local";
+export type BlackboxCaseRisk = "safe" | "mutation";
+export type BlackboxCaseStatus = "passed" | "failed" | "skipped" | "manual_review_required";
+
+export interface EvidenceRefs {
+  run?: string;
+  steps?: string[];
+  events?: string[];
+  scenarioReport?: string;
+  blackboxPlan?: string;
+  blackboxReport?: string;
+  screenshots?: string[];
+  accessibility?: string[];
+  actionTraces?: string[];
+  playwrightTraces?: string[];
+  locatorRepairs?: string[];
+  evidenceCapsule?: string;
+  exports?: string[];
+}
+
+export interface BlackboxLocatorCandidate {
+  strategy: "testid" | "role" | "label" | "placeholder" | "text" | "css";
+  value: string;
+  name?: string;
+  selector?: string;
+  score: number;
+  stabilityScore?: number;
+  reason?: string;
+}
+
+export interface BlackboxDiscoverControl {
+  role: "navigation" | "link" | "button" | "input" | "list" | "error" | "empty" | "loading";
+  selector: string;
+  text: string;
+  href?: string;
+  visible: boolean;
+  locatorCandidates?: BlackboxLocatorCandidate[];
+  preferredLocator?: BlackboxLocatorCandidate;
+  risk?: BlackboxCaseRisk;
+  riskFlags?: string[];
+  region?: "nav" | "toolbar" | "form" | "table" | "list" | "detail" | "modal" | "toast" | "main" | "unknown";
+  confidence?: number;
+  reason?: string;
+  stabilityScore?: number;
+  mutationRiskScore?: number;
+  geometry?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+}
+
+export interface BlackboxActionCandidate {
+  id: string;
+  role: BlackboxDiscoverControl["role"];
+  text: string;
+  selector: string;
+  preferredLocator?: BlackboxLocatorCandidate;
+  locatorCandidates: BlackboxLocatorCandidate[];
+  href?: string;
+  risk: BlackboxCaseRisk;
+  riskFlags: string[];
+  region?: "nav" | "toolbar" | "form" | "table" | "list" | "detail" | "modal" | "toast" | "main" | "unknown";
+  confidence?: number;
+  reason?: string;
+  stabilityScore?: number;
+  mutationRiskScore?: number;
+}
+
+export interface BlackboxIntentCandidate {
+  id: string;
+  kind: "nav" | "toolbar" | "form" | "table" | "list" | "detail" | "modal" | "toast" | "empty" | "error" | "loading";
+  confidence: number;
+  reason: string;
+  actionCandidateIds: string[];
+  assertionHints: BlackboxVisibleAssertion[];
+  risk: BlackboxCaseRisk;
+}
+
+export interface BlackboxDiscoverSummary {
+  target: BlackboxTarget;
+  targetUrl?: string;
+  title: string;
+  visibleText: string;
+  accessibilitySummary: string;
+  controls: BlackboxDiscoverControl[];
+  actionCandidates?: BlackboxActionCandidate[];
+  intentCandidates?: BlackboxIntentCandidate[];
+  locatorCandidates?: BlackboxLocatorCandidate[];
+  riskFlags?: string[];
+  coverageHints?: string[];
+  errorTokens: string[];
+  emptyTokens: string[];
+  generatedAt: string;
+  evidenceRefs?: EvidenceRefs;
+}
+
+export interface BlackboxStep {
+  id: string;
+  action:
+    | "open"
+    | "observe"
+    | "click"
+    | "fill"
+    | "press"
+    | "wait_visible"
+    | "enter_page"
+    | "pull_down_refresh"
+    | "switch_tab"
+    | "navigate_back";
+  selector?: string;
+  locator?: BlackboxLocatorCandidate;
+  text?: string;
+  value?: string;
+  route?: string;
+  pagePath?: string;
+  optional?: boolean;
+}
+
+export interface BlackboxVisibleAssertion {
+  id: string;
+  kind: "text_visible" | "selector_visible" | "url_changed" | "no_visible_error" | "visible_change";
+  text?: string;
+  selector?: string;
+}
+
+export interface BlackboxCase {
+  id: string;
+  caseNonce?: string;
+  target: BlackboxTarget;
+  userGoal: string;
+  entry: {
+    url?: string;
+    route?: string;
+    page?: string;
+  };
+  steps: BlackboxStep[];
+  visibleAssertions: BlackboxVisibleAssertion[];
+  risk: BlackboxCaseRisk;
+  source: BlackboxCaseSource;
+  preconditions?: string[];
+  dataPolicy?: "read_only" | "fixture_only" | "requires_seed_data" | "unknown";
+  mutationPolicy?: "forbid" | "allow_safe" | "allow_explicit";
+  waitStrategy?: {
+    kind: "domcontentloaded" | "networkidle" | "visible_assertion" | "timeout";
+    timeoutMs?: number;
+  };
+  branchAssertions?: BlackboxVisibleAssertion[];
+  cleanupPolicy?: "none" | "manual" | "driver";
+}
+
+export interface BlackboxPlan {
+  planId: string;
+  planNonce?: string;
+  target: BlackboxTarget;
+  targetProject: Record<string, unknown>;
+  cases: BlackboxCase[];
+  generationSource: "heuristic" | "goal" | "mixed";
+  skippedCandidates: string[];
+  safetyPolicy: {
+    allowMutations: boolean;
+    mutationKeywords: string[];
+  };
+  discoverSummary?: BlackboxDiscoverSummary;
+  evidenceRefs?: EvidenceRefs;
+}
+
+export interface BlackboxCaseRunReport {
+  caseId: string;
+  userGoal: string;
+  status: BlackboxCaseStatus;
+  visibleEvidence: string[];
+  runtimeEvidence: string[];
+  failureReason?: string;
+}
+
+export type BlackboxFailureCategory =
+  | "app_runtime_failure"
+  | "visible_assertion_failed"
+  | "locator_unstable"
+  | "auth_or_permission_required"
+  | "network_or_data_dependency"
+  | "driver_or_ledger_invalid";
+
+export interface BlackboxActionTrace {
+  runId: string;
+  planId: string;
+  caseId: string;
+  stepId: string;
+  userGoal: string;
+  status: BlackboxCaseStatus;
+  actions: Array<{
+    action: BlackboxStep["action"] | "computer_use_action";
+    selector?: string;
+    locator?: BlackboxLocatorCandidate;
+    urlBefore?: string;
+    urlAfter?: string;
+    visibleTextBefore?: string;
+    visibleTextAfter?: string;
+    runtimeClues?: string[];
+  }>;
+  assertionResults: Array<{ id: string; passed: boolean; reason: string }>;
+  screenshotRef?: string;
+  accessibilityRef?: string;
+  runtimeClues: string[];
+  generatedAt: string;
+}
+
+export interface LocatorRepairCandidate {
+  runId: string;
+  planId: string;
+  caseId: string;
+  stepId: string;
+  originalLocator?: BlackboxLocatorCandidate;
+  originalSelector?: string;
+  repairedLocator?: BlackboxLocatorCandidate;
+  repairReason: string;
+  assertionResults: Array<{ id: string; passed: boolean; reason: string }>;
+  screenshotRef?: string;
+  traceRef?: string;
+  status: "manual_review_required";
+  generatedAt: string;
+}
+
+export interface QualitySignal {
+  id: string;
+  kind: "visual_blank_screen_detected" | "a11y_key_control_unnamed" | "screenshot_unavailable" | "visual_snapshot";
+  severity: "blocking" | "warning" | "info";
+  message: string;
+  evidenceRef?: string;
+}
+
+export interface EvidenceCapsule {
+  runId: string;
+  planId?: string;
+  target?: BlackboxTarget;
+  status: "passed" | "failed" | "hold" | "manual_review_required" | "unknown";
+  summary: string;
+  verifiedGoals: string[];
+  failedCases: string[];
+  manualReviewCases: string[];
+  failureTaxonomy: BlackboxFailureCategory[];
+  visibleTextSummary: string[];
+  runtimeClues: string[];
+  qualitySignals: QualitySignal[];
+  evidenceRefs: EvidenceRefs;
+  generatedAt: string;
+}
+
+export interface AuthProfileRef {
+  name: string;
+  targetProjectRoot: string;
+  targetOrigin: string;
+  storageStateRef: string;
+  createdAt: string;
+}
+
+export interface BenchmarkRunReport {
+  benchmarkId: string;
+  fixture: string;
+  target: BlackboxTarget | "mixed";
+  passed: number;
+  failed: number;
+  manualReview: number;
+  reports: Array<{
+    fixture: string;
+    runId?: string;
+    reportRef?: string;
+    status: "passed" | "failed" | "manual_review_required";
+    target: BlackboxTarget | "unknown";
+  }>;
+  failureTaxonomy: BlackboxFailureCategory[];
+  coverageGaps: string[];
+  generatedAt: string;
+  demoProhibited?: boolean;
+}
+
+export interface BlackboxExportArtifact {
+  runId: string;
+  planId: string;
+  format: "playwright";
+  filePath: string;
+  content: string;
+  exportedCases: string[];
+  skippedCases: string[];
+  generatedAt: string;
+}
+
+export interface BlackboxRunReport {
+  runId: string;
+  planId: string;
+  target: BlackboxTarget;
+  passed: number;
+  failed: number;
+  cases: BlackboxCaseRunReport[];
+  visibleEvidence: string[];
+  runtimeEvidence: string[];
+  forExecutingAI: {
+    verifiedGoals: string[];
+    failedCases: string[];
+    userVisibleFindings: string[];
+    runtimeClues: string[];
+    nextRecommendation: string;
+    validatedUserFlows?: string[];
+    blockedUserFlows?: string[];
+    traceRefs?: string[];
+    evidenceCapsuleRef?: string;
+    exportRef?: string;
+    coverageGaps?: string[];
+    failureTaxonomy?: BlackboxFailureCategory[];
+  };
+  targetProject: Record<string, unknown>;
+  releaseDecision?: Record<string, unknown>;
+  blackboxGate?: {
+    passed: boolean;
+    reason: string;
+    blockingPassedCases: string[];
+    blockingFailedCases: string[];
+    runtimeBlockingItems: string[];
+  };
+  discoverSummary?: BlackboxDiscoverSummary;
+  evidenceRefs?: EvidenceRefs;
+  locatorRepairRefs?: string[];
+  visualEvidenceRefs?: string[];
+  a11yEvidenceRefs?: string[];
+  qualitySignals?: QualitySignal[];
+}
+
+export type HarnessGateStatus = "pass" | "hold";
+
+export interface HarnessGate {
+  status: HarnessGateStatus;
+  reasonCode: string;
+  blockingReasons: string[];
+  checks: {
+    targetProjectResolved: boolean;
+    targetMatchesBlackbox: boolean;
+    targetProjectMatchesBlackbox: boolean;
+    environmentStarted: boolean;
+    driverAvailable: boolean;
+    blackboxBlockingPass: boolean;
+    noBlackboxFailures: boolean;
+    noManualReview: boolean;
+    noBlockingRuntimeFailure: boolean;
+    evidenceRefsValid: boolean;
+    regressionSeededWhenFailed: boolean;
+    miniappProfileIsolated: boolean;
+  };
+}
+
+export interface RelayFailure {
+  reasonCode: string;
+  family: "target" | "driver" | "blackbox" | "harness" | "runtime" | "evidence" | "store" | "unknown";
+  severity: "blocking" | "warning" | "info";
+  userMessage: string;
+  recommendedAction: string;
+  retryable: boolean;
+  evidenceRefs?: EvidenceRefs;
+}
+
+export interface GateDecision {
+  status: "pass" | "hold";
+  reasonCode: string;
+  blockingReasons: string[];
+  checks: Record<string, boolean>;
+}
+
+export interface HarnessVerifyInput {
+  target: BlackboxTarget;
+  driver?: BlackboxDriver;
+  goals?: string[];
+  url?: string;
+  ledger?: string;
+  driverModule?: string;
+  storageState?: string;
+  authProfile?: string;
+  viewport?: "desktop" | "mobile" | "both";
+  visual?: boolean;
+  a11y?: boolean;
+  timeoutMs?: number;
+  noStart?: boolean;
+  noDiscover?: boolean;
+  noAutoPrepare?: boolean;
+  baselineRunId?: string;
+}
+
+export interface HarnessVerifyResult {
+  ok: boolean;
+  plan?: BlackboxPlan;
+  blackboxReport?: BlackboxRunReport;
+  harnessRunId?: string;
+  harnessReport?: HarnessVerificationReport;
+  artifactPath?: string;
+  exitStatus: number;
+  failure?: RelayFailure;
+}
+
+export interface MiniappDriverResolution {
+  required: boolean;
+  status: "available" | "missing" | "invalid" | "bridge_required";
+  mode: "driverModule" | "computer-use-ledger" | "builtin-devtools-automator" | "devtools-connect" | "none";
+  projectPath: string;
+  driverModule?: string;
+  ledgerRef?: string;
+  cliPath?: string;
+  servicePort?: string;
+  automatorVersion?: string;
+  capabilities: string[];
+  reasonCodes: string[];
+  blockingReasons: string[];
+  recommendedAction: string;
+  bootstrap?: MiniappDevToolsBootstrapResult;
+  profileIsolation?: "verified" | "attempted" | "unverified";
+}
+
+export interface MiniappDevToolsBootstrapResult {
+  ok: boolean;
+  status: "ready" | "pairing_required" | "needs_fix" | "failed";
+  profileDir: string;
+  managedHome: string;
+  stateFile: string;
+  cliPath: string;
+  projectPath: string;
+  servicePort: string;
+  servicePortReachable: boolean;
+  markerExists: boolean;
+  configFiles: string[];
+  reasonCodes: string[];
+  blockingReasons: string[];
+  recommendedAction: string;
+  pairingPlan?: MiniappBootstrapPairingPlan;
+  sidecar?: MiniappSidecarStatus;
+  autoPrepareAttempted?: boolean;
+  sidecarStarted?: boolean;
+  profileIsolation?: "verified" | "attempted" | "unverified";
+}
+
+export interface MiniappBootstrapPairingPlan {
+  driver: "computer-use";
+  reasonCode: "bootstrap_pairing_required";
+  targetApp: string;
+  servicePort: string;
+  projectPath: string;
+  profileDir: string;
+  expectedSettings: Record<string, unknown>;
+  steps: string[];
+  verification: {
+    command: string;
+    expectedSignals: string[];
+  };
+  ledgerTemplate: Record<string, unknown>;
+}
+
+export interface MiniappSidecarStatus {
+  ok: boolean;
+  installed: boolean;
+  running: boolean;
+  launchAgentPath: string;
+  sidecarScript: string;
+  port: string;
+  healthUrl: string;
+  statusUrl?: string;
+  tokenFile?: string;
+  servicePort?: string;
+  servicePortReachable?: boolean;
+  cliExists?: boolean;
+  markerExists?: boolean;
+  protectedStatusOk?: boolean;
+  controlledDevToolsProcess?: Record<string, unknown> | null;
+  profileIsolation?: "verified" | "attempted" | "unverified";
+  launchctlMessages?: string[];
+  reasonCodes: string[];
+  recommendedAction: string;
+}
+
+export interface RuntimeArtifactManifestEntry {
+  ref: string;
+  kind: string;
+  bytes: number;
+  sha256: string;
+  createdAt: string;
+  ownerRunId?: string;
+  ownerHarnessRunId?: string;
+}
+
+export interface RuntimeArtifactManifest {
+  schemaVersion: 1;
+  ownerRunId?: string;
+  ownerHarnessRunId?: string;
+  generatedAt: string;
+  entries: RuntimeArtifactManifestEntry[];
+}
+
+export interface HarnessRun {
+  harnessRunId: string;
+  target: BlackboxTarget;
+  targetProject: Record<string, unknown>;
+  driver: BlackboxDriver;
+  goals: string[];
+  linkedRunIds: string[];
+  blackboxRunId?: string;
+  planId?: string;
+  evidenceRefs?: EvidenceRefs;
+  evidenceIndexRef?: string;
+  artifactManifestRef?: string;
+  evidenceCapsuleRef?: string;
+  regressionSeedRef?: string;
+  createdAt: string;
+}
+
+export interface HarnessVerificationReport {
+  harnessRunId: string;
+  target: BlackboxTarget;
+  targetProject: Record<string, unknown>;
+  driver: BlackboxDriver;
+  goals: string[];
+  linkedRunIds: string[];
+  blackboxRunId?: string;
+  planId?: string;
+  blackboxGate?: BlackboxRunReport["blackboxGate"];
+  releaseDecision?: Record<string, unknown>;
+  gate: HarnessGate;
+  evidenceRefs: EvidenceRefs;
+  evidenceIndexRef: string;
+  artifactManifestRef?: string;
+  evidenceCapsuleRef?: string;
+  regressionSeedRef?: string;
+  forExecutingAI: {
+    status: HarnessGateStatus;
+    gateDecision: string;
+    verifiedUserFlows: string[];
+    blockedUserFlows: string[];
+    whatWasActuallySeen: string[];
+    runtimeClues: string[];
+    nextAction: string;
+    evidenceCapsuleRef?: string;
+    traceRefs: string[];
+    regressionRefs: string[];
+    userActionRequest?: {
+      required: boolean;
+      reasonCode: string;
+      minimalUserSteps: string[];
+      afterUserDoneCommand: string;
+      doNotAskUserIf: string[];
+    };
+    automationAttempts?: string[];
+    retryCommand?: string;
+  };
+  createdAt: string;
+}
+
+export interface ComputerUseLedgerCase {
+  caseId: string;
+  caseNonce?: string;
+  status?: BlackboxCaseStatus;
+  success?: boolean;
+  visibleEvidence?: string[];
+  visible_evidence?: string[];
+  runtimeEvidence?: string[];
+  actionLedger?: unknown[];
+  emittedEvents?: RelayLogInput[];
+  reason?: string;
+  failureReason?: string;
+}
+
+export interface ComputerUseLedger {
+  planId: string;
+  planNonce?: string;
+  target: BlackboxTarget;
+  targetProjectRoot: string;
+  targetUrl?: string;
+  driver: "computer-use";
+  createdAt: string;
+  cases: ComputerUseLedgerCase[];
+  actions?: ComputerUseLedgerCase[];
+  workspaceRoot?: string;
+  app?: string;
+  timeoutMs?: number;
+}
 
 export interface RelayErrorInfo {
   code: string;
@@ -431,6 +1021,11 @@ export interface ScenarioSpec {
     maxAttempts?: number;
     timeoutMs?: number;
     allowPartial?: boolean;
+  };
+  blackbox?: {
+    planId: string;
+    planNonce?: string;
+    caseNonces: Record<string, string>;
   };
 }
 
@@ -968,6 +1563,13 @@ export interface MiniappActionResult {
   emittedEvents?: RelayLogInput[];
 }
 
+export interface MiniappDriverEnvironment {
+  cliPath?: string;
+  servicePort?: string;
+  projectPath?: string;
+  profileDir?: string;
+}
+
 export interface DriverResolutionReport {
   target: "miniapp";
   driver: MiniappDriverType;
@@ -1117,6 +1719,11 @@ export interface ReleaseDecisionReport {
   why: string[];
   baselineRefs?: string[];
   blockingScenarioIds?: string[];
+  blackboxGate?: BlackboxRunReport["blackboxGate"];
+  blackboxRunId?: string;
+  blackboxPassedCases?: string[];
+  blackboxFailedCases?: string[];
+  blackboxEvidenceRefs?: EvidenceRefs;
 }
 
 export interface ExecutableHandoffArtifact {

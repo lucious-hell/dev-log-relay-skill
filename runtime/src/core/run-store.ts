@@ -28,6 +28,24 @@ export class RunStore {
   private readonly runSteps = new Map<string, string[]>();
   private readonly orderedRunIds: string[] = [];
 
+  hydrate(runs: TestRun[], steps: TestStep[]): void {
+    this.runs.clear();
+    this.steps.clear();
+    this.runSteps.clear();
+    this.orderedRunIds.splice(0, this.orderedRunIds.length);
+    for (const run of runs.slice().sort((left, right) => left.startedAt.localeCompare(right.startedAt))) {
+      this.runs.set(run.id, run);
+      this.runSteps.set(run.id, []);
+      this.orderedRunIds.push(run.id);
+    }
+    for (const step of steps.slice().sort((left, right) => left.startedSequence - right.startedSequence)) {
+      this.steps.set(step.id, step);
+      const list = this.runSteps.get(step.runId) || [];
+      list.push(step.id);
+      this.runSteps.set(step.runId, list);
+    }
+  }
+
   startRun(input: StartRunInput): TestRun {
     const run: TestRun = {
       id: randomUUID(),

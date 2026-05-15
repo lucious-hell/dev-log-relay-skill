@@ -2,6 +2,7 @@ import type {
     AutoloopAttemptCompleteInput,
     AutoloopAttemptStartInput,
     AutoloopStartInput,
+    BlackboxRunReport,
     CheckpointInput,
     ClosureEvidenceReport,
     LogLevel,
@@ -254,6 +255,89 @@ export class AiQueryService {
 
   projectBaselines(target?: TestTarget) {
     return this.engine.listProjectBaselines(target === "web" || target === "miniapp" ? target : undefined);
+  }
+
+  blackboxPlan(input: {
+    target?: TestTarget;
+    targetProject?: Record<string, unknown>;
+    goals?: string[];
+    maxCases?: number;
+    allowMutations?: boolean;
+    projectCheck?: Record<string, unknown>;
+    discoverSummary?: Parameters<RelayEngine["createBlackboxPlan"]>[0]["discoverSummary"];
+  }) {
+    return this.engine.createBlackboxPlan({
+      ...input,
+      target: input.target === "web" || input.target === "miniapp" ? input.target : "web",
+    });
+  }
+
+  recordBlackboxReport(report: BlackboxRunReport) {
+    return this.engine.recordBlackboxReport(report);
+  }
+
+  recordBlackboxReportResult(report: BlackboxRunReport) {
+    return this.engine.recordBlackboxReportResult(report);
+  }
+
+  runBlackboxReport(runId: string) {
+    return this.engine.getBlackboxReport(runId);
+  }
+
+  blackboxPlanById(planId: string) {
+    return this.engine.getBlackboxPlan(planId);
+  }
+
+  runEvidenceRefs(runId: string) {
+    return this.engine.getEvidenceRefs(runId);
+  }
+
+  runEvidenceCapsule(runId: string) {
+    return this.engine.getEvidenceCapsule(runId);
+  }
+
+  runEvidenceArtifactRef(runId: string, ref: string) {
+    return this.engine.readEvidenceArtifactRef(runId, ref);
+  }
+
+  runBlackboxTrace(runId: string) {
+    return this.engine.getBlackboxActionTraces(runId);
+  }
+
+  seedRegressionFromRun(runId: string) {
+    return this.engine.seedRegressionFromRun(runId);
+  }
+
+  saveBenchmarkReport(report: Parameters<RelayEngine["saveBenchmarkReport"]>[0]) {
+    return this.engine.saveBenchmarkReport(report);
+  }
+
+  exportBlackboxRun(runId: string, format: "playwright" = "playwright") {
+    return this.engine.exportBlackboxRun(runId, format);
+  }
+
+  createHarnessVerificationReport(input: Parameters<RelayEngine["createHarnessVerificationReport"]>[0]) {
+    return this.engine.createHarnessVerificationReport(input);
+  }
+
+  harnessVerificationReport(harnessRunId: string) {
+    return this.engine.getHarnessVerificationReport(harnessRunId);
+  }
+
+  harnessEvidenceArtifactRef(harnessRunId: string, ref: string) {
+    return this.engine.readHarnessEvidenceArtifactRef(harnessRunId, ref);
+  }
+
+  inspectRuntimeStore(input: { runId?: string; harnessRunId?: string }) {
+    return this.engine.inspectRuntimeStore(input);
+  }
+
+  cleanupRuntimeStore(input: { olderThanDays: number; dryRun?: boolean; confirm?: boolean }) {
+    return this.engine.cleanupRuntimeStore(input);
+  }
+
+  saveRunEvidenceArtifact(runId: string, name: string, extension: string, body: string | Buffer) {
+    return this.engine.saveRunEvidenceArtifact(runId, name, extension, body);
   }
 
   runStateReport(runId: string) {

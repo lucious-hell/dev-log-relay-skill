@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, mkdir, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import http from "node:http";
 import { EventEmitter } from "node:events";
 import { buildFingerprint } from "../src/core/fingerprint.js";
 import { RelayEngine } from "../src/core/relay-engine.js";
@@ -11,6 +12,12 @@ import { createWebRelay } from "../src/adapters/web.js";
 import { createMiniappRelay } from "../src/adapters/miniapp.js";
 import { createBackendRelay } from "../src/adapters/backend.js";
 import { runCli } from "../src/cli.js";
+import { executeMiniappReferenceDriver } from "../src/drivers/miniapp-reference-driver.js";
+import { validateComputerUseLedger } from "../src/core/validation.js";
+import { evaluateBlackboxGate, evaluateHarnessGate } from "../src/core/gate-evaluator.js";
+import { HarnessOrchestrator } from "../src/core/harness-orchestrator.js";
+import { bootstrapMiniappDevTools } from "../src/core/miniapp-devtools-bootstrap.js";
+import { resolveMiniappDriver } from "../src/core/miniapp-driver-resolver.js";
 import type { RelayConfig } from "../src/config.js";
 
 const artifactDir = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-artifacts-"));
@@ -25,6 +32,64 @@ const config: RelayConfig = {
   artifactDir,
   projectMemoryDir: path.join(artifactDir, "project-memory"),
 };
+
+test("skill harness wrapper scripts are present and executable", async () => {
+  const scriptsRoot = path.resolve(process.cwd(), "..", "scripts");
+  for (const scriptName of ["harness-verify.sh", "harness-report.sh", "harness-evidence.sh", "miniapp-bootstrap.sh", "miniapp-doctor.sh", "miniapp-sidecar.sh"]) {
+    const scriptStat = await stat(path.join(scriptsRoot, scriptName));
+    assert.equal(scriptStat.isFile(), true);
+    assert.equal((scriptStat.mode & 0o111) !== 0, true);
+  }
+});
+
+test("harness orchestrator dispatches and gate evaluator preserves blocking semantics", async () => {
+  const orchestrator = new HarnessOrchestrator({
+    verifyWeb: async (input) => ({ ok: true, exitStatus: 0, harnessRunId: `web:${input.target}` }),
+    verifyMiniapp: async (input) => ({ ok: false, exitStatus: 1, harnessRunId: `miniapp:${input.target}` }),
+  });
+  assert.equal((await orchestrator.verify({ target: "web", goals: ["open"] })).harnessRunId, "web:web");
+  assert.equal((await orchestrator.verify({ target: "miniapp", goals: ["open"] })).exitStatus, 1);
+  const blackboxGate = evaluateBlackboxGate({
+    blockingPassedCases: ["case-1"],
+    blockingFailedCases: [],
+    manualReviewCases: ["case-2"],
+    runtimeBlockingItems: [],
+  });
+  assert.equal(blackboxGate.passed, false);
+  assert.equal(blackboxGate.reason, "locator_repair_manual_review_required");
+  const harnessGate = evaluateHarnessGate({
+    targetProjectResolved: true,
+    targetMatchesBlackbox: true,
+    targetProjectMatchesBlackbox: true,
+    environmentStarted: true,
+    driverAvailable: true,
+    blackboxBlockingPass: true,
+    noBlackboxFailures: true,
+    noManualReview: false,
+    noBlockingRuntimeFailure: true,
+    evidenceRefsValid: true,
+    regressionSeededWhenFailed: true,
+    miniappProfileIsolated: true,
+  }, { failedCases: [], manualReviewCases: ["case-2"], runtimeBlockingItems: [] });
+  assert.equal(harnessGate.status, "hold");
+  assert.equal(harnessGate.reasonCode, "blackbox:case-2:manual_review_required");
+  const profileGate = evaluateHarnessGate({
+    targetProjectResolved: true,
+    targetMatchesBlackbox: true,
+    targetProjectMatchesBlackbox: true,
+    environmentStarted: true,
+    driverAvailable: true,
+    blackboxBlockingPass: true,
+    noBlackboxFailures: true,
+    noManualReview: true,
+    noBlockingRuntimeFailure: true,
+    evidenceRefsValid: true,
+    regressionSeededWhenFailed: true,
+    miniappProfileIsolated: false,
+  }, { failedCases: [], manualReviewCases: [], runtimeBlockingItems: [] });
+  assert.equal(profileGate.status, "hold");
+  assert.equal(profileGate.reasonCode, "miniapp_profile_isolation_unverified");
+});
 
 async function createMiniappProjectFixture() {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-miniapp-closure-"));
@@ -219,10 +284,10 @@ test("server exposes orchestration, diagnosis, closure, integrity, report, and a
   });
   const stepId = startStep.json().stepId as string;
 
-  await server.inject({
-    method: "POST",
-    url: "/ingest",
-    payload: {
+	  await server.inject({
+	    method: "POST",
+	    url: "/ingest",
+	    payload: {
       source: "admin-web",
       level: "error",
       message: "boom",
@@ -462,7 +527,7 @@ test("cli can call diagnosis and compare flows", async () => {
   assert.equal(code2, 0);
 });
 
-test("cli can run autoloop and miniapp verify flows", async () => {
+test("cli autoloop refuses to run without a real target project URL", async () => {
   const outputs: string[] = [];
   const fetchImpl: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -604,15 +669,17 @@ test("cli can run autoloop and miniapp verify flows", async () => {
     return child;
   }) as any;
 
-  const code1 = await runCli(["autoloop", "run", "--target", "web"], {
+  const code1 = await runCli(["autoloop", "run", "--target", "web", "--noStart"], {
     fetchImpl,
     spawnImpl,
     stdout: (text) => outputs.push(text),
     stderr: (text) => outputs.push(text),
   });
-  assert.equal(code1, 0);
-  assert.ok(outputs.join("").includes("loop-1"));
+  assert.equal(code1, 1);
+  assert.ok(outputs.join("").includes("target_project_url_required"));
+  assert.ok(outputs.join("").includes("demoProhibited"));
 
+  outputs.length = 0;
   const code2 = await runCli(["miniapp", "verify"], {
     fetchImpl,
     stdout: (text) => outputs.push(text),
@@ -1057,7 +1124,7 @@ test("miniapp adapter supports wrappers, runtime patch, and self-check", async (
         return;
       }
       if (typeof options.success === "function") {
-        options.success({ statusCode: 200 });
+        queueMicrotask(() => options.success({ statusCode: 200 }));
       }
     },
     navigateTo() {},
@@ -1075,11 +1142,22 @@ test("miniapp adapter supports wrappers, runtime patch, and self-check", async (
   relay.bindRun("run-2");
   relay.bindStep("step-2");
   const wrappedPage = relay.wrapPage("IndexPage", {
-    onLoad() {
+    onLoad(this: any) {
+      (globalThis as any).wx.request({
+        url: "https://api.example.com/async",
+        success: () => {
+          this.setData({ asyncReady: true });
+        },
+      });
       return "ok";
+    },
+    setData(payload: Record<string, unknown>, callback?: () => void) {
+      callback?.();
+      return payload;
     },
   });
   wrappedPage.onLoad();
+  await new Promise((resolve) => setTimeout(resolve, 0));
   const patch = relay.enableMiniappRuntimePatch();
   relay.capturePageLifecycle("IndexPage", "onLoad");
   relay.captureRouteSnapshot("/pages/index");
@@ -1093,6 +1171,7 @@ test("miniapp adapter supports wrappers, runtime patch, and self-check", async (
   assert.ok(calls.some((item) => item.phase === "lifecycle" && item.component === "IndexPage"));
   assert.ok(calls.some((item) => item.phase === "network"));
   assert.ok(calls.some((item) => Array.isArray(item.tags) && (item.tags as string[]).includes("state_signature")));
+  assert.ok(calls.some((item) => item.message === "IndexPage.setData" && (item.context as Record<string, unknown>)?.stateSignature === "asyncReady"));
   assert.ok(calls.some((item) => item.phase === "navigation" && Array.isArray(item.tags) && (item.tags as string[]).includes("route_transition")));
   assert.ok(calls.some((item) => typeof item.requestId === "string"));
   assert.ok(calls.some((item) => item.runId === "run-2" && item.stepId === "step-2"));
@@ -1459,54 +1538,21 @@ test("cli exposes detect, scenario, baseline, and summary commands", async () =>
   assert.ok(outputs.join("").includes("prComment"));
 });
 
-test("cli loop web keeps runner stdout out of top-level machine output", async () => {
+test("cli loop web forbids built-in demo modes", async () => {
   const outputs: string[] = [];
   const fetchImpl: typeof fetch = (async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.includes("/ai/targets/support")) {
       return new Response(JSON.stringify({ ok: true, report: { target: "web", status: "supported", reasonCode: "web_supported", reason: "supported", recommendedAction: "relay loop web", supportedTargets: ["web", "miniapp"], currentCapabilities: ["driver"], recommendedIntegrationMode: "browser-injected", evidenceSource: "runtime_relay" } }), { status: 200 });
     }
-    if (url.endsWith("/orchestrations/start")) {
-      return new Response(JSON.stringify({ ok: true, runId: "run-loop-1" }), { status: 200 });
-    }
-    if (url.includes("/summary")) {
-      return new Response(JSON.stringify({ ok: true, summary: { runId: "run-loop-1" } }), { status: 200 });
-    }
-    if (url.includes("/collection")) {
-      return new Response(JSON.stringify({ ok: true, collection: { runId: "run-loop-1", status: "complete", signalGaps: [] } }), { status: 200 });
-    }
-    if (url.includes("/diagnosis")) {
-      return new Response(JSON.stringify({ ok: true, diagnosis: { runId: "run-loop-1", suspectedRootCauses: [], missingSignals: [], topIncidents: [] } }), { status: 200 });
-    }
-    if (url.includes("/closure")) {
-      return new Response(JSON.stringify({ ok: true, closure: { decision: { status: "resolved" } } }), { status: 200 });
-    }
-    if (url.includes("/integrity")) {
-      return new Response(JSON.stringify({ ok: true, integrity: { runId: "run-loop-1", integrityScore: 100, warnings: [] } }), { status: 200 });
-    }
-    if (url.includes("/scenario")) {
-      return new Response(JSON.stringify({ ok: true, scenario: { runId: "run-loop-1", scenarioId: "request_to_ui_continuity", status: "passed" } }), { status: 200 });
-    }
-    if (url.includes("/baseline")) {
-      return new Response(JSON.stringify({ ok: true, baseline: { runId: "run-loop-1", scenarioId: "request_to_ui_continuity", evidenceLayer: "user_flow_closed" } }), { status: 200 });
-    }
-    if (url.includes("/report")) {
-      return new Response(JSON.stringify({ ok: true, report: { runId: "run-loop-1", verdict: { status: "resolved" } } }), { status: 200 });
-    }
-    if (url.includes("/artifact")) {
-      return new Response(JSON.stringify({ ok: true, artifact: { run: { id: "run-loop-1" } }, filePath: "/tmp/run-loop-1.json" }), { status: 200 });
-    }
     return new Response(JSON.stringify({ ok: true, changed: [] }), { status: 200 });
   }) as typeof fetch;
 
   const spawnImpl = ((_: string, __: readonly string[]) => {
+    outputs.push("spawn-called");
     const child = new EventEmitter() as unknown as ReturnType<typeof spawn> & { stdout?: EventEmitter; stderr?: EventEmitter };
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
-    queueMicrotask(() => {
-      child.stdout?.emit("data", '{\n  "ok": true,\n  "fromRunner": true\n}\n');
-      child.emit("exit", 0);
-    });
     return child;
   }) as any;
 
@@ -1516,11 +1562,1305 @@ test("cli loop web keeps runner stdout out of top-level machine output", async (
     stdout: (text) => outputs.push(text),
     stderr: (text) => outputs.push(text),
   });
-  assert.equal(code, 0);
+  assert.equal(code, 1);
   assert.equal(outputs.length, 1);
   const parsed = JSON.parse(outputs[0]);
-  assert.equal(parsed.runId, "run-loop-1");
-  assert.equal(parsed.exampleEvidence?.fromRunner, true);
+  assert.equal(parsed.reasonCode, "demo_runner_forbidden");
+  assert.equal(parsed.demoProhibited, true);
+  assert.equal(outputs.join("").includes("spawn-called"), false);
+});
+
+test("cli loop web runs against an explicit real target url", async () => {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-web-target-"));
+  await mkdir(path.join(workspaceRoot, "src"), { recursive: true });
+  await writeFile(
+    path.join(workspaceRoot, "package.json"),
+    JSON.stringify({
+      dependencies: { react: "latest", vite: "latest" },
+      scripts: { dev: "vite" },
+    }),
+    "utf8"
+  );
+  await writeFile(path.join(workspaceRoot, "src/main.tsx"), "console.info('entry')\n", "utf8");
+  await writeFile(path.join(workspaceRoot, "src/api.ts"), "export async function load() {}\n", "utf8");
+  await writeFile(path.join(workspaceRoot, "src/ErrorBoundary.tsx"), "export function ErrorBoundary() { return null }\n", "utf8");
+  let targetHits = 0;
+  const targetServer = http.createServer((req, res) => {
+    targetHits += 1;
+    if (req.url === "/api/data") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(`<!doctype html><html><body><main id="status">loading</main><script>
+      fetch('/api/data').then((res) => res.json()).then(() => {
+        document.getElementById('status').textContent = 'ready';
+        console.info('target-ready');
+      });
+    </script></body></html>`);
+  });
+  await new Promise<void>((resolve) => targetServer.listen(0, "127.0.0.1", resolve));
+  const address = targetServer.address();
+  const targetUrl = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}/`;
+  const runtimeStoreDir = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-blackbox-store-"));
+  const relayServer = createRelayServer({ ...config, port: 0, runtimeStoreDir });
+  const relay = await relayServer.listen({ port: 0, host: "127.0.0.1" });
+  const relayUrl = typeof relay === "string" ? relay.replace(/\/$/, "") : `http://127.0.0.1:${config.port}`;
+  const previousWorkspaceRoot = process.env.DEV_LOG_RELAY_WORKSPACE_ROOT;
+  const outputs: string[] = [];
+  const webScenarioRunnerImpl = (async (fetchImpl: typeof fetch, relayEndpoint: string, runId: string, targetProject: any) => {
+    await fetchImpl(targetProject.targetUrl);
+    const step = await fetchImpl(`${relayEndpoint}/runs/${runId}/steps/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "navigate-target", kind: "navigate", route: "/", metadata: { targetUrl: targetProject.targetUrl, demoProhibited: true } }),
+    }).then((res) => res.json() as Promise<{ stepId: string }>);
+    await fetchImpl(`${relayEndpoint}/ingest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: "admin-web", level: "info", message: "render_complete:test_driver", phase: "render", tags: ["render_complete"], runId, stepId: step.stepId, route: "/" }),
+    });
+    await fetchImpl(`${relayEndpoint}/runs/${runId}/steps/${step.stepId}/end`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "passed" }),
+    });
+    await fetchImpl(`${relayEndpoint}/runs/${runId}/end`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "passed" }),
+    });
+    await fetchImpl(`${relayEndpoint}/scenarios/validate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ runId, templateName: "web_home_cold_start", target: "web" }),
+    });
+    const [summary, collection, diagnosis, closure, integrity, scenario, baseline, report, releaseDecision] = await Promise.all([
+      fetchImpl(`${relayEndpoint}/ai/run/${runId}/summary`).then((res) => res.json() as Promise<any>),
+      fetchImpl(`${relayEndpoint}/ai/run/${runId}/collection`).then((res) => res.json() as Promise<any>),
+      fetchImpl(`${relayEndpoint}/ai/run/${runId}/diagnosis`).then((res) => res.json() as Promise<any>),
+      fetchImpl(`${relayEndpoint}/ai/run/${runId}/closure`).then((res) => res.json() as Promise<any>),
+      fetchImpl(`${relayEndpoint}/ai/run/${runId}/integrity`).then((res) => res.json() as Promise<any>),
+      fetchImpl(`${relayEndpoint}/ai/run/${runId}/scenario`).then((res) => res.json() as Promise<any>),
+      fetchImpl(`${relayEndpoint}/ai/run/${runId}/baseline`).then((res) => res.json() as Promise<any>),
+      fetchImpl(`${relayEndpoint}/ai/run/${runId}/report`).then((res) => res.json() as Promise<any>),
+      fetchImpl(`${relayEndpoint}/ai/run/${runId}/release-decision`).then((res) => res.json() as Promise<any>),
+    ]);
+    return {
+      summary: summary.summary,
+      collection: collection.collection,
+      diagnosis: diagnosis.diagnosis,
+      closure: closure.closure,
+      integrity: integrity.integrity,
+      scenario: scenario.scenario,
+      baseline: baseline.baseline,
+      report: report.report,
+      releaseDecision: releaseDecision.releaseDecision,
+      scenarioDiff: [],
+      stateDiff: [],
+      targetProject,
+    };
+  }) as any;
+  process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = workspaceRoot;
+  try {
+    const code = await runCli(["loop", "web", "--relay", relayUrl, "--url", targetUrl, "--templateName", "web_home_cold_start"], {
+      webScenarioRunnerImpl,
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(code, 0);
+    const parsed = JSON.parse(outputs.join(""));
+    assert.equal(parsed.demoProhibited, true);
+    assert.equal(parsed.targetProject.targetUrl, targetUrl);
+    assert.equal(parsed.targetProject.workspaceRoot, workspaceRoot);
+    assert.notEqual(JSON.stringify(parsed).includes("fromRunner"), true);
+    assert.ok(targetHits > 0);
+
+    outputs.length = 0;
+    const spawnImpl = ((_: string, __: readonly string[]) => {
+      const child = new EventEmitter() as unknown as ReturnType<typeof spawn> & { stdout?: EventEmitter; stderr?: EventEmitter; kill?: () => boolean };
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => true;
+      queueMicrotask(() => child.stdout?.emit("data", `Local: ${targetUrl}\n`));
+      return child;
+    }) as any;
+    const autoCode = await runCli(["loop", "web", "--relay", relayUrl, "--webCommand", "npm run dev"], {
+      spawnImpl,
+      webScenarioRunnerImpl,
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(autoCode, 0);
+    const autoParsed = JSON.parse(outputs.join(""));
+    assert.equal(autoParsed.targetProject.targetUrl, targetUrl);
+    assert.equal(autoParsed.targetProject.urlSource, "stdout");
+    assert.equal(autoParsed.targetProject.startCommand, "npm run dev");
+  } finally {
+    process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = previousWorkspaceRoot;
+    await relayServer.close();
+    await new Promise<void>((resolve) => targetServer.close(() => resolve()));
+  }
+});
+
+test("blackbox discover builds observe inventory with stable locators and mutation risk flags", async () => {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-observe-"));
+  const targetServer = http.createServer((_, res) => {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(`<!doctype html>
+      <html>
+        <body>
+          <nav><a href="/products" aria-label="Open products">Products</a></nav>
+          <main>
+            <h1>Catalog</h1>
+            <input data-testid="catalog-search" aria-label="Search catalog" placeholder="Search products" />
+            <button aria-label="Delete product">Delete</button>
+            <a href="/checkout">Pay now</a>
+            <ul><li>Alpha</li><li>Beta</li></ul>
+          </main>
+        </body>
+      </html>`);
+  });
+  await new Promise<void>((resolve) => targetServer.listen(0, "127.0.0.1", resolve));
+  const address = targetServer.address();
+  const targetUrl = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}/`;
+  const previousWorkspaceRoot = process.env.DEV_LOG_RELAY_WORKSPACE_ROOT;
+  const outputs: string[] = [];
+  const relayServer = createRelayServer({ ...config, port: 0 });
+  process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = workspaceRoot;
+  try {
+    const code = await runCli(["blackbox", "discover", "--target", "web", "--url", targetUrl], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(code, 0);
+    const payload = JSON.parse(outputs.join(""));
+    const summary = payload.discoverSummary;
+    const searchControl = summary.controls.find((control: any) => control.selector === "[data-testid=\"catalog-search\"]");
+    assert.equal(searchControl.preferredLocator.strategy, "testid");
+    assert.equal(searchControl.preferredLocator.value, "catalog-search");
+    assert.equal(searchControl.region, "form");
+    assert.ok(searchControl.stabilityScore >= 90);
+    assert.ok(summary.actionCandidates.some((candidate: any) => candidate.preferredLocator?.strategy === "testid"));
+    assert.ok(summary.actionCandidates.some((candidate: any) => candidate.risk === "mutation" && candidate.text.includes("Delete")));
+    assert.ok(summary.actionCandidates.some((candidate: any) => candidate.region === "nav" && candidate.confidence > 50));
+    assert.ok(summary.actionCandidates.some((candidate: any) => candidate.mutationRiskScore > 0));
+    assert.ok(summary.intentCandidates.some((intent: any) => intent.kind === "nav" && intent.actionCandidateIds.length > 0));
+    assert.ok(summary.intentCandidates.some((intent: any) => intent.kind === "form" && intent.assertionHints.length > 0));
+    assert.ok(summary.riskFlags.some((flag: string) => flag.includes("mutation")));
+    assert.ok(summary.coverageHints.includes("list_or_detail_candidate"));
+    const apiDiscover = await relayServer.inject({
+      method: "POST",
+      url: "/ai/blackbox/discover",
+      payload: { target: "web", url: targetUrl },
+    });
+    assert.equal(apiDiscover.statusCode, 200);
+    const apiSummary = apiDiscover.json().discoverSummary;
+    assert.ok(apiSummary.actionCandidates.some((candidate: any) => candidate.preferredLocator?.strategy === "testid"));
+    assert.ok(apiSummary.intentCandidates.some((intent: any) => intent.kind === "nav"));
+    assert.ok(apiSummary.riskFlags.some((flag: string) => flag.includes("mutation")));
+    assert.ok(apiSummary.coverageHints.includes("list_or_detail_candidate"));
+  } finally {
+    process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = previousWorkspaceRoot;
+    await relayServer.close();
+    await new Promise<void>((resolve) => targetServer.close(() => resolve()));
+  }
+});
+
+test("blackbox cli plans and runs only against real target projects", async () => {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-blackbox-web-"));
+  await writeFile(path.join(workspaceRoot, "package.json"), JSON.stringify({ scripts: { dev: "vite" }, dependencies: { vite: "^5.0.0" } }), "utf8");
+  await mkdir(path.join(workspaceRoot, "src"), { recursive: true });
+  await writeFile(path.join(workspaceRoot, "src/main.tsx"), "console.info('blackbox entry')\n", "utf8");
+  let targetHits = 0;
+  const targetServer = http.createServer((_, res) => {
+    targetHits += 1;
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end("<!doctype html><html><body><nav><a href='/items'>Items</a></nav><main>Catalog Ready</main><input aria-label='Search' /></body></html>");
+  });
+  await new Promise<void>((resolve) => targetServer.listen(0, "127.0.0.1", resolve));
+  const address = targetServer.address();
+  const targetUrl = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}/`;
+  const runtimeStoreDir = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-blackbox-store-"));
+  const relayServer = createRelayServer({ ...config, port: 0, runtimeStoreDir });
+  const relay = await relayServer.listen({ port: 0, host: "127.0.0.1" });
+  const relayUrl = typeof relay === "string" ? relay.replace(/\/$/, "") : `http://127.0.0.1:${config.port}`;
+  const previousWorkspaceRoot = process.env.DEV_LOG_RELAY_WORKSPACE_ROOT;
+  const outputs: string[] = [];
+  const blackboxWebRunnerImpl = (async (fetchImpl: typeof fetch, relayEndpoint: string, runId: string, targetProject: any, plan: any) => {
+    const response = await fetchImpl(targetProject.targetUrl);
+    const visible = await response.text();
+    const traceDir = path.join(runtimeStoreDir, "evidence", runId);
+    await mkdir(traceDir, { recursive: true });
+    const playwrightTracePath = path.join(traceDir, `${runId}.playwright-trace.zip`);
+    await writeFile(playwrightTracePath, "trace");
+    const cases = plan.cases.map((testCase: any) => ({
+      caseId: testCase.id,
+      userGoal: testCase.userGoal,
+      status: "passed",
+      visibleEvidence: [`target:${targetProject.targetUrl}`, visible.slice(0, 120)],
+      runtimeEvidence: [],
+    }));
+    for (const testCase of plan.cases) {
+      const step = await fetchImpl(`${relayEndpoint}/runs/${runId}/steps/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: `blackbox:${testCase.id}`, kind: "assert", route: "/", metadata: { blackboxCaseId: testCase.id } }),
+      }).then((res) => res.json() as Promise<{ stepId: string }>);
+      await fetchImpl(`${relayEndpoint}/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: "admin-web",
+          level: "info",
+          message: `route:${targetProject.targetUrl}`,
+          phase: "navigation",
+          tags: ["route_changed"],
+          runId,
+          stepId: step.stepId,
+          route: "/",
+        }),
+      });
+      await fetchImpl(`${relayEndpoint}/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: "admin-web",
+          level: "info",
+          message: `blackbox_assertion:${testCase.id}:passed`,
+          phase: "render",
+          tags: ["blackbox_assertion", "visible_evidence", `blackbox_assertion:${testCase.id}:passed`],
+          runId,
+          stepId: step.stepId,
+          context: { visibleEvidence: [visible.slice(0, 120)] },
+        }),
+      });
+      await fetchImpl(`${relayEndpoint}/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: "admin-web",
+          level: "info",
+          message: `blackbox_action_trace:${testCase.id}:passed`,
+          phase: "system",
+          tags: ["blackbox_action_trace", `blackbox_case:${testCase.id}`],
+          runId,
+          stepId: step.stepId,
+          context: {
+            actionTrace: {
+              runId,
+              planId: plan.planId,
+              caseId: testCase.id,
+              stepId: step.stepId,
+              userGoal: testCase.userGoal,
+              status: "passed",
+              actions: [
+                {
+                  action: "assert_visible",
+                  locator: testCase.steps?.[0]?.locator,
+                  urlBefore: targetProject.targetUrl,
+                  urlAfter: targetProject.targetUrl,
+                  visibleTextBefore: visible.slice(0, 80),
+                  visibleTextAfter: visible.slice(0, 80),
+                },
+              ],
+              assertionResults: [{ id: "visible_evidence", passed: true, reason: visible.slice(0, 80) }],
+              runtimeClues: [],
+              generatedAt: new Date().toISOString(),
+            },
+          },
+        }),
+      });
+      await fetchImpl(`${relayEndpoint}/runs/${runId}/steps/${step.stepId}/end`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "passed" }),
+      });
+    }
+    await fetchImpl(`${relayEndpoint}/runs/${runId}/end`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "passed" }),
+    });
+    await fetchImpl(`${relayEndpoint}/scenarios/validate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        runId,
+        spec: {
+          id: `${plan.planId}_suite`,
+          target: "web",
+          entry: { route: "/" },
+          steps: plan.cases.map((testCase: any) => ({ id: testCase.id, kind: "wait_render", eventPhase: "render", match: `blackbox_assertion:${testCase.id}:passed` })),
+          expectations: plan.cases.map((testCase: any) => testCase.userGoal),
+          fallbacks: [],
+          assertions: plan.cases.map((testCase: any) => ({ id: `${testCase.id}_visible`, type: "continuity", match: `blackbox_assertion:${testCase.id}:passed`, blocking: true })),
+          stateTransitions: [],
+          blockingByDefault: true,
+          baselinePolicy: "when_passed",
+        },
+      }),
+    });
+    return {
+      runId,
+      planId: plan.planId,
+      target: "web",
+      passed: cases.length,
+      failed: 0,
+      cases,
+      visibleEvidence: cases.flatMap((item: any) => item.visibleEvidence),
+      runtimeEvidence: [],
+      forExecutingAI: {
+        verifiedGoals: cases.map((item: any) => item.userGoal),
+        failedCases: [],
+        userVisibleFindings: cases.flatMap((item: any) => item.visibleEvidence),
+        runtimeClues: [],
+        nextRecommendation: "ok",
+      },
+      targetProject,
+      evidenceRefs: { playwrightTraces: [playwrightTracePath] },
+    };
+  }) as any;
+  process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = workspaceRoot;
+  try {
+    const noUrlCode = await runCli(["blackbox", "plan", "--relay", relayUrl, "--target", "web", "--noStart"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(noUrlCode, 1);
+    assert.equal(JSON.parse(outputs.join("")).reasonCode, "target_project_url_required");
+
+    outputs.length = 0;
+    const harnessNoUrlCode = await runCli(["harness", "verify", "--relay", relayUrl, "--target", "web", "--noStart"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(harnessNoUrlCode, 1);
+    assert.equal(JSON.parse(outputs.join("")).reasonCode, "harness_target_unresolved");
+
+    outputs.length = 0;
+    const runCode = await runCli(["blackbox", "run", "--relay", relayUrl, "--target", "web", "--url", targetUrl, "--driver", "playwright", "--goal", "用户浏览商品列表"], {
+      blackboxWebRunnerImpl,
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(runCode, 0, outputs.join(""));
+    const payload = JSON.parse(outputs.join(""));
+    assert.equal(payload.demoProhibited, true);
+	  assert.equal(payload.blackboxReport.targetProject.targetUrl, targetUrl);
+	  assert.ok(payload.plan.cases.some((item: any) => item.source === "goal"));
+	  assert.ok(payload.blackboxReport.visibleEvidence.some((item: string) => item.includes("Catalog Ready")));
+    assert.ok(payload.blackboxReport.evidenceRefs.actionTraces.length > 0);
+    assert.ok(payload.blackboxReport.evidenceRefs.playwrightTraces.length > 0);
+    assert.ok(payload.blackboxReport.forExecutingAI.traceRefs.length > 0);
+	  assert.ok(targetHits > 0);
+
+    outputs.length = 0;
+    const harnessCode = await runCli(["harness", "verify", "--relay", relayUrl, "--target", "web", "--url", targetUrl, "--driver", "playwright", "--goal", "用户浏览商品列表"], {
+      blackboxWebRunnerImpl,
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(harnessCode, 0, outputs.join(""));
+    const harnessPayload = JSON.parse(outputs.join(""));
+    assert.equal(harnessPayload.harness, true);
+    assert.equal(harnessPayload.harnessReport.gate.status, "pass");
+    assert.equal(harnessPayload.harnessReport.forExecutingAI.status, "pass");
+    assert.equal(harnessPayload.harnessReport.targetProject.targetUrl, targetUrl);
+    assert.ok(harnessPayload.harnessReport.evidenceIndexRef);
+    assert.ok(harnessPayload.harnessReport.evidenceRefs.actionTraces.length > 0);
+
+    outputs.length = 0;
+    const harnessReportCode = await runCli(["harness", "report", "--relay", relayUrl, "--harnessRunId", harnessPayload.harnessRunId], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(harnessReportCode, 0);
+    assert.equal(JSON.parse(outputs.join("")).harnessReport.harnessRunId, harnessPayload.harnessRunId);
+
+    outputs.length = 0;
+    const harnessEvidenceCode = await runCli(["harness", "evidence", "--relay", relayUrl, "--harnessRunId", harnessPayload.harnessRunId, "--ref", harnessPayload.harnessReport.evidenceIndexRef], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(harnessEvidenceCode, 0);
+    assert.equal(JSON.parse(outputs.join("")).artifact.contentType, "application/json");
+
+    outputs.length = 0;
+    const storeInspectCode = await runCli(["store", "inspect", "--relay", relayUrl, "--harnessRunId", harnessPayload.harnessRunId, "--pretty"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(storeInspectCode, 0);
+    assert.equal(JSON.parse(outputs.join("")).manifest.schemaVersion, 1);
+
+    outputs.length = 0;
+    const cleanupCode = await runCli(["store", "cleanup", "--relay", relayUrl, "--olderThanDays", "99999", "--dryRun", "--pretty"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(cleanupCode, 0);
+    assert.equal(JSON.parse(outputs.join("")).cleanup.dryRun, true);
+
+    const invalidHarnessEvidence = await relayServer.inject({
+      method: "GET",
+      url: `/ai/harness/${harnessPayload.harnessRunId}/evidence?ref=${encodeURIComponent("/etc/passwd")}`,
+    });
+    assert.equal(invalidHarnessEvidence.statusCode, 400);
+    assert.equal(invalidHarnessEvidence.json().reasonCode, "harness_evidence_invalid");
+
+    outputs.length = 0;
+    const traceCode = await runCli(["blackbox", "trace", "--relay", relayUrl, "--runId", payload.blackboxReport.runId], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(traceCode, 0);
+    const tracePayload = JSON.parse(outputs.join(""));
+    assert.ok(tracePayload.summary.some((trace: any) => trace.caseId === payload.plan.cases[0].id));
+    assert.ok(tracePayload.evidenceRefs.actionTraces.length > 0);
+
+    outputs.length = 0;
+    const capsuleCode = await runCli(["blackbox", "capsule", "--relay", relayUrl, "--runId", payload.blackboxReport.runId], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(capsuleCode, 0);
+    const capsulePayload = JSON.parse(outputs.join(""));
+    assert.equal(capsulePayload.capsule.runId, payload.blackboxReport.runId);
+    assert.ok(capsulePayload.capsule.evidenceRefs.actionTraces.length > 0);
+
+    const invalidRef = await relayServer.inject({
+      method: "GET",
+      url: `/ai/run/${payload.blackboxReport.runId}/evidence-artifact?ref=${encodeURIComponent("/etc/passwd")}`,
+    });
+    assert.equal(invalidRef.statusCode, 400);
+    assert.equal(invalidRef.json().reasonCode, "evidence_artifact_ref_invalid");
+
+    const reportArtifact = await relayServer.inject({
+      method: "GET",
+      url: `/ai/run/${payload.blackboxReport.runId}/evidence-artifact?ref=${encodeURIComponent(payload.blackboxReport.evidenceRefs.blackboxReport)}`,
+    });
+    assert.equal(reportArtifact.statusCode, 200);
+    const unrelatedRun = await relayServer.inject({ method: "POST", url: "/runs/start", payload: { label: "unrelated", target: "web" } });
+    const crossRunArtifact = await relayServer.inject({
+      method: "GET",
+      url: `/ai/run/${unrelatedRun.json().runId}/evidence-artifact?ref=${encodeURIComponent(payload.blackboxReport.evidenceRefs.blackboxReport)}`,
+    });
+    assert.equal(crossRunArtifact.statusCode, 400);
+    assert.equal(crossRunArtifact.json().reasonCode, "evidence_artifact_ref_invalid");
+
+    outputs.length = 0;
+    const exportCode = await runCli(["blackbox", "export", "--relay", relayUrl, "--runId", payload.blackboxReport.runId, "--format", "playwright"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(exportCode, 0);
+    const exportPayload = JSON.parse(outputs.join(""));
+    assert.ok(exportPayload.export.content.includes("@playwright/test"));
+    assert.ok(exportPayload.export.content.includes(targetUrl));
+    assert.ok(exportPayload.export.content.includes(`runId:${payload.blackboxReport.runId}`));
+    assert.ok(!String(exportPayload.export.filePath).startsWith(workspaceRoot));
+
+    outputs.length = 0;
+    const explicitExportPath = path.join(workspaceRoot, "tooling/blackbox/exported.spec.ts");
+    const explicitExportCode = await runCli(["blackbox", "export", "--relay", relayUrl, "--runId", payload.blackboxReport.runId, "--format", "playwright", "--out", explicitExportPath], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(explicitExportCode, 0);
+    const explicitExportPayload = JSON.parse(outputs.join(""));
+    assert.ok(!String(explicitExportPayload.export.filePath).startsWith(workspaceRoot));
+    assert.equal(explicitExportPayload.writtenFilePath, explicitExportPath);
+    assert.ok((await readFile(explicitExportPath, "utf8")).includes(`caseId:${payload.plan.cases[0].id}`));
+
+    const ledgerPath = path.join(workspaceRoot, "blackbox-ledger.json");
+    await writeFile(
+      ledgerPath,
+      JSON.stringify({
+        planId: payload.plan.planId,
+        planNonce: payload.plan.planNonce,
+        target: "web",
+        targetProjectRoot: workspaceRoot,
+        targetUrl,
+        driver: "computer-use",
+        createdAt: new Date().toISOString(),
+        cases: payload.plan.cases.map((testCase: any) => ({
+          caseId: testCase.id,
+          caseNonce: testCase.caseNonce,
+          status: "passed",
+          visibleEvidence: [`Computer Use saw ${testCase.id}`],
+          actionLedger: [`open ${targetUrl}`, `assert visible ${testCase.id}`],
+        })),
+      }),
+      "utf8"
+    );
+    outputs.length = 0;
+    const ledgerRunCode = await runCli(["blackbox", "run", "--relay", relayUrl, "--target", "web", "--driver", "computer-use", "--ledger", ledgerPath, "--noStart"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(ledgerRunCode, 0, outputs.join(""));
+    const ledgerPayload = JSON.parse(outputs.join(""));
+    assert.equal(ledgerPayload.plan.planId, payload.plan.planId);
+    assert.equal(ledgerPayload.blackboxReport.passed, payload.plan.cases.length);
+
+	  outputs.length = 0;
+    const reportCode = await runCli(["blackbox", "report", "--relay", relayUrl, "--runId", payload.blackboxReport.runId], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(reportCode, 0);
+    assert.equal(JSON.parse(outputs.join("")).blackboxReport.runId, payload.blackboxReport.runId);
+
+    outputs.length = 0;
+    const seedCode = await runCli(["blackbox", "seed-regression", "--relay", relayUrl, "--runId", payload.blackboxReport.runId], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(seedCode, 0);
+    assert.equal(JSON.parse(outputs.join("")).regressionSeed.runId, payload.blackboxReport.runId);
+
+    outputs.length = 0;
+    const blockingRunner = (async (fetchImpl: typeof fetch, relayEndpoint: string, runId: string, targetProject: any, plan: any) => {
+      const step = await fetchImpl(`${relayEndpoint}/runs/${runId}/steps/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "blackbox:blocking", kind: "assert", route: "/", metadata: { blackboxCaseId: plan.cases[0].id } }),
+      }).then((res) => res.json() as Promise<{ stepId: string }>);
+      await fetchImpl(`${relayEndpoint}/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: "admin-web",
+          level: "info",
+          message: `blackbox_assertion:${plan.cases[0].id}:passed`,
+          phase: "render",
+          tags: ["blackbox_assertion", "visible_evidence", `blackbox_assertion:${plan.cases[0].id}:passed`],
+          runId,
+          stepId: step.stepId,
+          context: { visibleEvidence: ["Catalog Ready"] },
+        }),
+      });
+      await fetchImpl(`${relayEndpoint}/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: "admin-web",
+          level: "error",
+          message: "runtime failure",
+          phase: "render",
+          tags: ["runtime_failure"],
+          runId,
+          stepId: step.stepId,
+        }),
+      });
+      await fetchImpl(`${relayEndpoint}/runs/${runId}/steps/${step.stepId}/end`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "passed" }),
+      });
+      await fetchImpl(`${relayEndpoint}/runs/${runId}/end`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "passed" }),
+      });
+      return {
+        runId,
+        planId: plan.planId,
+        target: "web",
+        passed: 1,
+        failed: 0,
+        cases: [{ caseId: plan.cases[0].id, userGoal: plan.cases[0].userGoal, status: "passed", visibleEvidence: ["Catalog Ready"], runtimeEvidence: [] }],
+        visibleEvidence: ["Catalog Ready"],
+        runtimeEvidence: ["error:runtime failure"],
+        forExecutingAI: { verifiedGoals: [plan.cases[0].userGoal], failedCases: [], userVisibleFindings: ["Catalog Ready"], runtimeClues: ["error:runtime failure"], nextRecommendation: "hold" },
+        targetProject,
+        releaseDecision: { decision: "hold", blockingItems: ["runtime_failure"] },
+      };
+    }) as any;
+    const blockingCode = await runCli(["blackbox", "run", "--relay", relayUrl, "--target", "web", "--url", targetUrl, "--driver", "playwright"], {
+      blackboxWebRunnerImpl: blockingRunner,
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(blockingCode, 1);
+    assert.equal(JSON.parse(outputs.join("")).ok, false);
+
+    outputs.length = 0;
+    const harnessBlockingCode = await runCli(["harness", "verify", "--relay", relayUrl, "--target", "web", "--url", targetUrl, "--driver", "playwright"], {
+      blackboxWebRunnerImpl: blockingRunner,
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(harnessBlockingCode, 1);
+    const harnessBlocking = JSON.parse(outputs.join(""));
+    assert.equal(harnessBlocking.harnessReport.gate.status, "hold");
+    assert.ok(harnessBlocking.harnessReport.regressionSeedRef);
+    assert.ok(harnessBlocking.harnessReport.gate.blockingReasons.length > 0);
+
+    outputs.length = 0;
+    const noEvidenceRunner = (async (fetchImpl: typeof fetch, relayEndpoint: string, runId: string, targetProject: any, plan: any) => {
+      await fetchImpl(`${relayEndpoint}/runs/${runId}/end`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "failed" }),
+      });
+      return {
+        runId,
+        planId: plan.planId,
+        target: "web",
+        passed: 0,
+        failed: 1,
+        cases: [{ caseId: plan.cases[0].id, userGoal: plan.cases[0].userGoal, status: "failed", visibleEvidence: [], runtimeEvidence: [], failureReason: "visible_evidence_required" }],
+        visibleEvidence: [],
+        runtimeEvidence: [],
+        forExecutingAI: { verifiedGoals: [], failedCases: [plan.cases[0].id], userVisibleFindings: [], runtimeClues: [], nextRecommendation: "hold" },
+        targetProject,
+      };
+    }) as any;
+    const noEvidenceCode = await runCli(["blackbox", "run", "--relay", relayUrl, "--target", "web", "--url", targetUrl, "--driver", "playwright"], {
+      blackboxWebRunnerImpl: noEvidenceRunner,
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(noEvidenceCode, 1);
+    const noEvidencePayload = JSON.parse(outputs.join(""));
+    assert.equal(noEvidencePayload.reasonCode, "visible_evidence_required");
+    assert.equal(noEvidencePayload.blackboxReport.failed, 1);
+
+    outputs.length = 0;
+    const harnessNoEvidenceCode = await runCli(["harness", "verify", "--relay", relayUrl, "--target", "web", "--url", targetUrl, "--driver", "playwright"], {
+      blackboxWebRunnerImpl: noEvidenceRunner,
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(harnessNoEvidenceCode, 1);
+    const harnessNoEvidencePayload = JSON.parse(outputs.join(""));
+    assert.equal(harnessNoEvidencePayload.reasonCode, "harness_blackbox_required");
+    assert.equal(harnessNoEvidencePayload.failure.reasonCode, "harness_blackbox_required");
+    assert.equal(harnessNoEvidencePayload.blackboxReport.failed, 1);
+  } finally {
+    process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = previousWorkspaceRoot;
+    await relayServer.close();
+    await new Promise<void>((resolve) => targetServer.close(() => resolve()));
+  }
+});
+
+test("miniapp driver check returns structured resolver failures", async () => {
+  const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-miniapp-driver-check-"));
+  const relayHome = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-home-"));
+  const previousWorkspaceRoot = process.env.DEV_LOG_RELAY_WORKSPACE_ROOT;
+  const previousRelayHome = process.env.DEV_LOG_RELAY_HOME;
+  process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = workspaceRoot;
+  process.env.DEV_LOG_RELAY_HOME = relayHome;
+  const outputs: string[] = [];
+  const relayServer = createRelayServer({ ...config, port: 0 });
+  const relay = await relayServer.listen({ port: 0, host: "127.0.0.1" });
+  const relayUrl = typeof relay === "string" ? relay.replace(/\/$/, "") : `http://127.0.0.1:${config.port}`;
+  try {
+    const bootstrapBeforeFix = await bootstrapMiniappDevTools({ workspaceRoot, servicePort: "9420" });
+    assert.equal(bootstrapBeforeFix.ok, false);
+    assert.ok(bootstrapBeforeFix.reasonCodes.includes("miniapp_bootstrap_required"));
+    const bootstrapAfterFix = await bootstrapMiniappDevTools({ workspaceRoot, servicePort: "9420", fix: true });
+    assert.equal(bootstrapAfterFix.ok, true);
+    assert.equal(bootstrapAfterFix.servicePort, "9420");
+    assert.ok(bootstrapAfterFix.configFiles.length >= 1);
+    assert.equal(JSON.parse(await readFile(bootstrapAfterFix.configFiles[0], "utf8"))["security.enableServicePort"], true);
+    outputs.length = 0;
+    const bootstrapCode = await runCli(["miniapp", "bootstrap", "--fix", "--servicePort", "9421", "--pretty"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(bootstrapCode, 0);
+    assert.equal(JSON.parse(outputs.join("")).bootstrap.servicePort, "9421");
+    outputs.length = 0;
+    const pairingCode = await runCli(["miniapp", "bootstrap", "--driver", "computer-use", "--pretty"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(pairingCode, 0);
+    const pairingPayload = JSON.parse(outputs.join(""));
+    assert.equal(pairingPayload.bootstrap.pairingPlan.driver, "computer-use");
+    assert.equal(pairingPayload.bootstrap.pairingPlan.reasonCode, "bootstrap_pairing_required");
+    outputs.length = 0;
+    const sidecarCode = await runCli(["miniapp", "sidecar", "install", "--dryRun", "--pretty"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(sidecarCode, 0);
+    const sidecarPayload = JSON.parse(outputs.join(""));
+    assert.equal(sidecarPayload.action, "install");
+    assert.ok(sidecarPayload.sidecar.plistPreview.includes("com.dev-log-relay.miniapp-sidecar"));
+    outputs.length = 0;
+    const directResolution = resolveMiniappDriver({ workspaceRoot, driver: "devtools-automator" });
+    assert.equal(directResolution.status, "missing");
+    assert.ok(directResolution.reasonCodes.includes("miniapp_project_path_unresolved"));
+    const code = await runCli(["miniapp", "driver", "check", "--pretty"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(code, 1);
+    const payload = JSON.parse(outputs.join(""));
+    assert.equal(payload.driverResolution.required, true);
+    assert.ok(payload.driverResolution.reasonCodes.includes("miniapp_project_path_unresolved"));
+    await writeFile(path.join(workspaceRoot, "project.config.json"), JSON.stringify({ miniprogramRoot: "." }), "utf8");
+    await writeFile(path.join(workspaceRoot, "app.json"), JSON.stringify({ pages: ["pages/index/index"] }), "utf8");
+    const fixtureDriver = path.join(workspaceRoot, "driver.mjs");
+    await writeFile(fixtureDriver, "export async function runMiniappScenario(){ return { actions: [] }; }\n", "utf8");
+    const driverModuleResolution = resolveMiniappDriver({ workspaceRoot, driver: "devtools-automator", driverModule: fixtureDriver });
+    assert.equal(driverModuleResolution.status, "available");
+    assert.equal(driverModuleResolution.mode, "driverModule");
+    assert.ok(!driverModuleResolution.reasonCodes.includes("miniapp_cli_not_found"));
+    outputs.length = 0;
+    const harnessCode = await runCli(["harness", "verify", "--relay", relayUrl, "--target", "miniapp", "--driver", "devtools-automator", "--noAutoPrepare"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(harnessCode, 1);
+    assert.equal(JSON.parse(outputs.join("")).reasonCode, "harness_driver_unavailable");
+    assert.equal(JSON.parse(outputs.join("")).bootstrap.servicePort, "9420");
+    const harnessPayload = JSON.parse(outputs.join(""));
+    assert.equal(typeof harnessPayload.forExecutingAI.userActionRequest.required, "boolean");
+    assert.equal(typeof harnessPayload.forExecutingAI.retryCommand, "string");
+  } finally {
+    process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = previousWorkspaceRoot;
+    if (previousRelayHome === undefined) {
+      delete process.env.DEV_LOG_RELAY_HOME;
+    } else {
+      process.env.DEV_LOG_RELAY_HOME = previousRelayHome;
+    }
+    await relayServer.close();
+  }
+});
+
+test("blackbox API rejects forged reports and maps safe goals to executable actions", async () => {
+  const server = createRelayServer({ ...config, port: 0 });
+  const planResponse = await server.inject({
+    method: "POST",
+    url: "/ai/blackbox/plan",
+    payload: {
+      target: "web",
+      targetProject: { workspaceRoot: process.cwd(), resolvedProjectRoot: process.cwd(), targetUrl: "http://127.0.0.1:5173/" },
+      goals: ["搜索订单", "delete user"],
+      maxCases: 5,
+      allowMutations: "false",
+      projectCheck: {},
+    },
+  });
+  assert.equal(planResponse.statusCode, 200);
+  const plan = planResponse.json().plan;
+  assert.ok(plan.planNonce);
+  assert.ok(plan.cases.every((item: any) => item.caseNonce));
+  const searchCase = plan.cases.find((item: any) => item.source === "goal");
+  assert.ok(searchCase.steps.some((step: any) => step.action === "fill"));
+  assert.ok(searchCase.steps.some((step: any) => step.action === "press"));
+  assert.ok(plan.skippedCandidates.some((item: string) => item.includes("mutation_risk")));
+  const locatorPlanResponse = await server.inject({
+    method: "POST",
+    url: "/ai/blackbox/plan",
+    payload: {
+      target: "web",
+      targetProject: { workspaceRoot: process.cwd(), resolvedProjectRoot: process.cwd(), targetUrl: "http://127.0.0.1:5173/" },
+      goals: ["搜索订单"],
+      maxCases: 1,
+      allowMutations: "false",
+      projectCheck: {},
+      discoverSummary: {
+        target: "web",
+        targetUrl: "http://127.0.0.1:5173/",
+        title: "Orders",
+        visibleText: "Orders Search",
+        accessibilitySummary: "",
+        controls: [],
+        actionCandidates: [{
+          id: "candidate_1",
+          role: "input",
+          text: "Search orders",
+          selector: "[data-testid=\"orders-search\"]",
+          preferredLocator: { strategy: "testid", value: "orders-search", selector: "[data-testid=\"orders-search\"]", score: 100 },
+          locatorCandidates: [{ strategy: "testid", value: "orders-search", selector: "[data-testid=\"orders-search\"]", score: 100 }],
+          risk: "safe",
+          riskFlags: [],
+        }],
+        locatorCandidates: [{ strategy: "testid", value: "orders-search", selector: "[data-testid=\"orders-search\"]", score: 100 }],
+        riskFlags: [],
+        coverageHints: [],
+        generatedAt: new Date().toISOString(),
+      },
+    },
+  });
+  assert.equal(locatorPlanResponse.statusCode, 200);
+  const locatorPlan = locatorPlanResponse.json().plan;
+  assert.equal(locatorPlan.cases[0].source, "goal");
+  assert.equal(locatorPlan.cases[0].steps.find((step: any) => step.action === "fill").locator.strategy, "testid");
+  assert.equal(locatorPlan.cases[0].steps.find((step: any) => step.action === "fill").locator.value, "orders-search");
+  assert.equal(
+    validateComputerUseLedger(
+      {
+        planId: plan.planId,
+        planNonce: "wrong",
+        target: "web",
+        targetProjectRoot: process.cwd(),
+        targetUrl: "http://127.0.0.1:5173/",
+        driver: "computer-use",
+        createdAt: new Date().toISOString(),
+        cases: [{ caseId: plan.cases[0].id, caseNonce: plan.cases[0].caseNonce, visibleEvidence: ["fake"], actionLedger: ["click"] }],
+      },
+      plan,
+      plan.targetProject
+    ).reasonCode,
+    "computer_use_ledger_invalid"
+  );
+  assert.equal(
+    validateComputerUseLedger(
+      {
+        planId: plan.planId,
+        planNonce: plan.planNonce,
+        target: "web",
+        targetProjectRoot: process.cwd(),
+        targetUrl: "http://127.0.0.1:5173/",
+        driver: "computer-use",
+        createdAt: new Date().toISOString(),
+        cases: [{
+          caseId: plan.cases[0].id,
+          caseNonce: plan.cases[0].caseNonce,
+          visibleEvidence: ["partial"],
+          actionLedger: ["click"],
+        }],
+      },
+      plan,
+      plan.targetProject
+    ).reasonCode,
+    plan.cases.length > 1 ? "computer_use_ledger_invalid" : undefined
+  );
+
+  const runStart = await server.inject({
+    method: "POST",
+    url: "/runs/start",
+    payload: { label: "forged blackbox", target: "web" },
+  });
+  const forged = await server.inject({
+    method: "POST",
+    url: "/blackbox/run",
+    payload: {
+      report: {
+        runId: runStart.json().runId,
+        planId: plan.planId,
+        target: "web",
+        passed: 1,
+        failed: 0,
+        cases: [{ caseId: plan.cases[0].id, userGoal: plan.cases[0].userGoal, status: "passed", visibleEvidence: ["fake"], runtimeEvidence: [] }],
+        visibleEvidence: ["fake"],
+        runtimeEvidence: [],
+        forExecutingAI: { verifiedGoals: [plan.cases[0].userGoal], failedCases: [], userVisibleFindings: ["fake"], runtimeClues: [], nextRecommendation: "ship" },
+        targetProject: plan.targetProject,
+      },
+    },
+  });
+	  assert.equal(forged.statusCode, 409);
+	  assert.equal(forged.json().failure.reasonCode, forged.json().reasonCode);
+	  assert.equal(forged.json().failure.severity, "blocking");
+	  const invalidBenchmark = await server.inject({
+    method: "POST",
+    url: "/ai/benchmark/blackbox",
+    payload: { report: { benchmarkId: "bench-forged", target: "mixed", reports: "not-array" } },
+  });
+  assert.equal(invalidBenchmark.statusCode, 400);
+  assert.equal(invalidBenchmark.json().reasonCode, "benchmark_report_invalid");
+  await server.close();
+});
+
+test("blackbox report storage recomputes release gate from server-side runtime state", async () => {
+  const server = createRelayServer({ ...config, port: 0 });
+  const targetProject = { workspaceRoot: process.cwd(), resolvedProjectRoot: process.cwd(), targetUrl: "http://127.0.0.1:5173/" };
+  const planResponse = await server.inject({
+    method: "POST",
+    url: "/ai/blackbox/plan",
+    payload: { target: "web", targetProject, noDiscover: true, maxCases: 1 },
+  });
+  const plan = planResponse.json().plan;
+  const runStart = await server.inject({
+    method: "POST",
+    url: "/runs/start",
+    payload: { label: "server gate", target: "web", metadata: { blackbox: true, projectRoot: process.cwd(), targetProject } },
+  });
+  const runId = runStart.json().runId;
+  const stepStart = await server.inject({
+    method: "POST",
+    url: `/runs/${runId}/steps/start`,
+    payload: { name: "blackbox", kind: "assert", route: "/" },
+  });
+  const stepId = stepStart.json().stepId;
+  await server.inject({
+    method: "POST",
+    url: "/ingest",
+    payload: {
+      source: "admin-web",
+      level: "info",
+      message: `blackbox_assertion:${plan.cases[0].id}:passed`,
+      phase: "render",
+      tags: ["blackbox_assertion", "visible_evidence", `blackbox_assertion:${plan.cases[0].id}:passed`],
+      runId,
+      stepId,
+      context: { visibleEvidence: ["Catalog Ready"] },
+    },
+  });
+  await server.inject({
+    method: "POST",
+    url: "/ingest",
+    payload: { source: "admin-web", level: "error", message: "runtime failure", phase: "render", runId, stepId },
+  });
+  await server.inject({ method: "POST", url: `/runs/${runId}/steps/${stepId}/end`, payload: { status: "failed" } });
+  await server.inject({ method: "POST", url: `/runs/${runId}/end`, payload: { status: "failed" } });
+  const stored = await server.inject({
+    method: "POST",
+    url: "/blackbox/run",
+    payload: {
+      report: {
+        runId,
+        planId: plan.planId,
+        target: "web",
+        passed: 1,
+        failed: 0,
+        cases: [{ caseId: plan.cases[0].id, userGoal: plan.cases[0].userGoal, status: "passed", visibleEvidence: ["Catalog Ready"], runtimeEvidence: [] }],
+        visibleEvidence: ["Catalog Ready"],
+        runtimeEvidence: [],
+        forExecutingAI: { verifiedGoals: [plan.cases[0].userGoal], failedCases: [], userVisibleFindings: ["Catalog Ready"], runtimeClues: [], nextRecommendation: "ship" },
+        targetProject,
+        releaseDecision: { decision: "ship", blockingItems: [] },
+      },
+    },
+  });
+  assert.equal(stored.statusCode, 200);
+  assert.equal(stored.json().report.blackboxGate.reason, "runtime_blocking_failure");
+  assert.equal(stored.json().report.releaseDecision.decision, "hold");
+  assert.match(stored.json().report.forExecutingAI.nextRecommendation, /hold/);
+
+  const notFoundRun = await server.inject({
+    method: "POST",
+    url: "/runs/start",
+    payload: { label: "server gate 404", target: "web", metadata: { blackbox: true, projectRoot: process.cwd(), targetProject } },
+  });
+  const notFoundRunId = notFoundRun.json().runId;
+  const notFoundStep = await server.inject({
+    method: "POST",
+    url: `/runs/${notFoundRunId}/steps/start`,
+    payload: { name: "blackbox 404", kind: "assert", route: "/" },
+  });
+  const notFoundStepId = notFoundStep.json().stepId;
+  await server.inject({
+    method: "POST",
+    url: "/ingest",
+    payload: {
+      source: "admin-web",
+      level: "info",
+      message: `blackbox_assertion:${plan.cases[0].id}:passed`,
+      phase: "render",
+      tags: ["blackbox_assertion", "visible_evidence", `blackbox_assertion:${plan.cases[0].id}:passed`],
+      runId: notFoundRunId,
+      stepId: notFoundStepId,
+      context: { visibleEvidence: ["Not Found"] },
+    },
+  });
+  await server.inject({ method: "POST", url: `/runs/${notFoundRunId}/steps/${notFoundStepId}/end`, payload: { status: "passed" } });
+  await server.inject({ method: "POST", url: `/runs/${notFoundRunId}/end`, payload: { status: "passed" } });
+  const notFoundStored = await server.inject({
+    method: "POST",
+    url: "/blackbox/run",
+    payload: {
+      report: {
+        runId: notFoundRunId,
+        planId: plan.planId,
+        target: "web",
+        passed: 1,
+        failed: 0,
+        cases: [{ caseId: plan.cases[0].id, userGoal: plan.cases[0].userGoal, status: "passed", visibleEvidence: ["Not Found"], runtimeEvidence: ["network:404:http://127.0.0.1/missing"] }],
+        visibleEvidence: ["Not Found"],
+        runtimeEvidence: ["network:404:http://127.0.0.1/missing"],
+        forExecutingAI: { verifiedGoals: [plan.cases[0].userGoal], failedCases: [], userVisibleFindings: ["Not Found"], runtimeClues: ["network:404"], nextRecommendation: "ship" },
+        targetProject,
+      },
+    },
+  });
+  assert.equal(notFoundStored.statusCode, 200);
+  assert.equal(notFoundStored.json().report.blackboxGate.reason, "runtime_blocking_failure");
+  assert.ok(notFoundStored.json().report.blackboxGate.runtimeBlockingItems.some((item: string) => item.includes("404")));
+
+  const manualRun = await server.inject({
+    method: "POST",
+    url: "/runs/start",
+    payload: { label: "manual review gate", target: "web", metadata: { blackbox: true, projectRoot: process.cwd(), targetProject } },
+  });
+  const manualRunId = manualRun.json().runId;
+  const manualStep = await server.inject({
+    method: "POST",
+    url: `/runs/${manualRunId}/steps/start`,
+    payload: { name: "blackbox manual", kind: "assert", route: "/" },
+  });
+  const manualStepId = manualStep.json().stepId;
+  await server.inject({
+    method: "POST",
+    url: "/ingest",
+    payload: {
+      source: "admin-web",
+      level: "info",
+      message: `blackbox_assertion:${plan.cases[0].id}:passed`,
+      phase: "render",
+      tags: ["blackbox_assertion", "visible_evidence", `blackbox_assertion:${plan.cases[0].id}:passed`],
+      runId: manualRunId,
+      stepId: manualStepId,
+      context: { visibleEvidence: ["Catalog Ready"] },
+    },
+  });
+  await server.inject({ method: "POST", url: `/runs/${manualRunId}/steps/${manualStepId}/end`, payload: { status: "passed" } });
+  await server.inject({ method: "POST", url: `/runs/${manualRunId}/end`, payload: { status: "passed" } });
+  const manualStored = await server.inject({
+    method: "POST",
+    url: "/blackbox/run",
+    payload: {
+      report: {
+        runId: manualRunId,
+        planId: plan.planId,
+        target: "web",
+        passed: 1,
+        failed: 0,
+        cases: [
+          { caseId: plan.cases[0].id, userGoal: plan.cases[0].userGoal, status: "passed", visibleEvidence: ["Catalog Ready"], runtimeEvidence: [] },
+          { caseId: plan.cases[0].id, userGoal: "人工复核 locator", status: "manual_review_required", visibleEvidence: ["Catalog Ready after repaired locator"], runtimeEvidence: [], failureReason: "locator_repair_manual_review_required" },
+        ],
+        visibleEvidence: ["Catalog Ready"],
+        runtimeEvidence: [],
+        forExecutingAI: { verifiedGoals: [plan.cases[0].userGoal], failedCases: [], userVisibleFindings: ["Catalog Ready"], runtimeClues: [], nextRecommendation: "ship" },
+        targetProject,
+      },
+    },
+  });
+  assert.equal(manualStored.statusCode, 200);
+  assert.equal(manualStored.json().report.blackboxGate.passed, false);
+  assert.equal(manualStored.json().report.blackboxGate.reason, "locator_repair_manual_review_required");
+  assert.ok(manualStored.json().report.blackboxGate.runtimeBlockingItems.some((item: string) => item.includes("manual_review_required")));
+  await server.close();
+});
+
+test("blackbox reports persist across relay server restart and expose evidence refs", async () => {
+  const runtimeStoreDir = await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-store-"));
+  const server = createRelayServer({ ...config, runtimeStoreDir });
+  const targetProject = { workspaceRoot: process.cwd(), resolvedProjectRoot: process.cwd(), targetUrl: "http://127.0.0.1:5173/" };
+  const planResponse = await server.inject({
+    method: "POST",
+    url: "/ai/blackbox/plan",
+    payload: { target: "web", targetProject, noDiscover: true, maxCases: 1 },
+  });
+  const plan = planResponse.json().plan;
+  const runStart = await server.inject({
+    method: "POST",
+    url: "/runs/start",
+    payload: { label: "persistent blackbox", target: "web", metadata: { targetProject } },
+  });
+  const runId = runStart.json().runId;
+  const stepStart = await server.inject({
+    method: "POST",
+    url: `/runs/${runId}/steps/start`,
+    payload: { name: "blackbox", kind: "assert", route: "/" },
+  });
+  const stepId = stepStart.json().stepId;
+  await server.inject({
+    method: "POST",
+    url: "/ingest",
+    payload: {
+      source: "admin-web",
+      level: "info",
+      message: `blackbox_assertion:${plan.cases[0].id}:passed`,
+      phase: "render",
+      tags: ["blackbox_assertion", "visible_evidence", `blackbox_assertion:${plan.cases[0].id}:passed`],
+      runId,
+      stepId,
+      context: { visibleEvidence: ["Catalog Ready"] },
+    },
+  });
+  await server.inject({
+    method: "POST",
+    url: "/ingest",
+    payload: {
+      source: "admin-web",
+      level: "info",
+      message: `blackbox_action_trace:${plan.cases[0].id}:malformed`,
+      phase: "system",
+      tags: ["blackbox_action_trace", `blackbox_case:${plan.cases[0].id}`],
+      runId,
+      stepId,
+      context: {
+        actionTrace: {
+          runId,
+          planId: plan.planId,
+          caseId: plan.cases[0].id,
+          status: "passed",
+          actions: [],
+          assertionResults: [],
+          runtimeClues: [],
+        },
+      },
+    },
+  });
+  await server.inject({
+    method: "POST",
+    url: "/ingest",
+    payload: {
+      source: "admin-web",
+      level: "info",
+      message: `blackbox_action_trace:${plan.cases[0].id}:passed`,
+      phase: "system",
+      tags: ["blackbox_action_trace", `blackbox_case:${plan.cases[0].id}`],
+      runId,
+      stepId,
+      context: {
+        actionTrace: {
+          runId,
+          planId: plan.planId,
+          caseId: plan.cases[0].id,
+          stepId,
+          userGoal: plan.cases[0].userGoal,
+          status: "passed",
+          actions: [{ action: "observe", urlBefore: targetProject.targetUrl, urlAfter: targetProject.targetUrl, visibleTextAfter: "Catalog Ready" }],
+          assertionResults: [{ id: "visible_evidence", passed: true, reason: "Catalog Ready" }],
+          runtimeClues: [],
+          generatedAt: new Date().toISOString(),
+        },
+	      },
+	    },
+	  });
+  const secondStep = await server.inject({
+    method: "POST",
+    url: `/runs/${runId}/steps/start`,
+    payload: { name: "blackbox mobile", kind: "assert", route: "/", metadata: { viewport: "mobile" } },
+  });
+  const secondStepId = secondStep.json().stepId;
+  await server.inject({
+    method: "POST",
+    url: "/ingest",
+    payload: {
+      source: "admin-web",
+      level: "info",
+      message: `blackbox_action_trace:${plan.cases[0].id}:passed:mobile`,
+      phase: "system",
+      tags: ["blackbox_action_trace", `blackbox_case:${plan.cases[0].id}`],
+      runId,
+      stepId: secondStepId,
+      context: {
+        actionTrace: {
+          runId,
+          planId: plan.planId,
+          caseId: plan.cases[0].id,
+          stepId: secondStepId,
+          userGoal: plan.cases[0].userGoal,
+          status: "passed",
+          actions: [{ action: "observe", urlBefore: targetProject.targetUrl, urlAfter: targetProject.targetUrl, visibleTextAfter: "Catalog Ready mobile" }],
+          assertionResults: [{ id: "visible_evidence", passed: true, reason: "Catalog Ready mobile" }],
+          runtimeClues: [],
+          generatedAt: new Date().toISOString(),
+        },
+      },
+    },
+  });
+  await server.inject({ method: "POST", url: `/runs/${runId}/steps/${secondStepId}/end`, payload: { status: "passed" } });
+	  await server.inject({ method: "POST", url: `/runs/${runId}/steps/${stepId}/end`, payload: { status: "passed" } });
+  await server.inject({ method: "POST", url: `/runs/${runId}/end`, payload: { status: "passed" } });
+  const stored = await server.inject({
+    method: "POST",
+    url: "/blackbox/run",
+    payload: {
+      report: {
+        runId,
+        planId: plan.planId,
+        target: "web",
+        passed: 1,
+        failed: 0,
+        cases: [{ caseId: plan.cases[0].id, userGoal: plan.cases[0].userGoal, status: "passed", visibleEvidence: ["Catalog Ready"], runtimeEvidence: [] }],
+        visibleEvidence: ["Catalog Ready"],
+        runtimeEvidence: [],
+        forExecutingAI: { verifiedGoals: [plan.cases[0].userGoal], failedCases: [], userVisibleFindings: ["Catalog Ready"], runtimeClues: [], nextRecommendation: "ok" },
+        targetProject,
+      },
+    },
+  });
+  assert.equal(stored.statusCode, 200);
+  assert.ok(stored.json().report.evidenceRefs.blackboxReport);
+  const harnessStored = await server.inject({
+    method: "POST",
+    url: "/ai/harness/verify",
+    payload: { target: "web", driver: "playwright", blackboxRunId: runId, targetProject, goals: ["用户打开目录"] },
+  });
+  assert.equal(harnessStored.statusCode, 200);
+  const harnessRunId = harnessStored.json().harnessRunId;
+  assert.ok(harnessStored.json().harnessReport.evidenceIndexRef);
+  const harnessAlias = await server.inject({
+    method: "POST",
+    url: "/ai/harness/from-blackbox-run",
+    payload: { target: "web", driver: "playwright", blackboxRunId: runId, targetProject, goals: ["用户打开目录"] },
+  });
+  assert.equal(harnessAlias.statusCode, 200);
+  assert.ok(harnessAlias.json().harnessRunId);
+  assert.equal(harnessAlias.json().harnessReport.blackboxRunId, runId);
+  const harnessNoDriver = await server.inject({
+    method: "POST",
+    url: "/ai/harness/from-blackbox-run",
+    payload: { target: "web", blackboxRunId: runId, targetProject, goals: ["用户打开目录"] },
+  });
+  assert.equal(harnessNoDriver.statusCode, 200);
+  assert.equal(harnessNoDriver.json().ok, false);
+  assert.equal(harnessNoDriver.json().harnessReport.gate.reasonCode, "harness_driver_unavailable");
+  const mismatchedTargetProject = { ...targetProject, targetUrl: `${targetProject.targetUrl}/other` };
+  const harnessMismatch = await server.inject({
+    method: "POST",
+    url: "/ai/harness/from-blackbox-run",
+    payload: { target: "web", driver: "playwright", blackboxRunId: runId, targetProject: mismatchedTargetProject, goals: ["用户打开目录"] },
+  });
+  assert.equal(harnessMismatch.statusCode, 200);
+  assert.equal(harnessMismatch.json().ok, false);
+  assert.equal(harnessMismatch.json().harnessReport.gate.reasonCode, "harness_target_mismatch");
+  await server.close();
+
+  const restarted = createRelayServer({ ...config, runtimeStoreDir });
+  const report = await restarted.inject({ method: "GET", url: `/ai/run/${runId}/blackbox-report` });
+  assert.equal(report.statusCode, 200);
+  assert.equal(report.json().blackboxReport.runId, runId);
+  const refs = await restarted.inject({ method: "GET", url: `/ai/run/${runId}/evidence-refs` });
+  assert.equal(refs.statusCode, 200);
+  assert.ok(refs.json().evidenceRefs.events.length >= 1);
+  assert.ok(refs.json().evidenceRefs.actionTraces.length >= 1);
+  const trace = await restarted.inject({ method: "GET", url: `/ai/run/${runId}/blackbox-trace?format=relay` });
+  assert.equal(trace.statusCode, 200);
+  assert.equal(trace.json().traces.length, 2);
+  assert.equal(trace.json().traces[0].caseId, plan.cases[0].id);
+  const exported = await restarted.inject({ method: "POST", url: `/ai/run/${runId}/blackbox-export`, payload: { format: "playwright" } });
+  assert.equal(exported.statusCode, 200);
+  assert.ok(exported.json().export.content.includes(`caseId:${plan.cases[0].id}`));
+  const harnessReport = await restarted.inject({ method: "GET", url: `/ai/harness/${harnessRunId}/report` });
+  assert.equal(harnessReport.statusCode, 200);
+  assert.equal(harnessReport.json().harnessReport.harnessRunId, harnessRunId);
+  assert.ok(harnessReport.json().harnessReport.artifactManifestRef);
+  const harnessArtifact = await restarted.inject({
+    method: "GET",
+    url: `/ai/harness/${harnessRunId}/evidence?ref=${encodeURIComponent(harnessReport.json().harnessReport.evidenceIndexRef)}`,
+  });
+  assert.equal(harnessArtifact.statusCode, 200);
+  const manifestArtifact = await restarted.inject({
+    method: "GET",
+    url: `/ai/harness/${harnessRunId}/evidence?ref=${encodeURIComponent(harnessReport.json().harnessReport.artifactManifestRef)}`,
+  });
+  assert.equal(manifestArtifact.statusCode, 200);
+  const storeInspect = await restarted.inject({ method: "GET", url: `/ai/store/inspect?runId=${encodeURIComponent(runId)}` });
+  assert.equal(storeInspect.statusCode, 200);
+  assert.equal(storeInspect.json().manifest.schemaVersion, 1);
+  assert.ok(storeInspect.json().manifest.entries.some((entry: any) => entry.ref.includes("artifact-manifest.json")));
+  const harnessInspect = await restarted.inject({ method: "GET", url: `/ai/store/inspect?harnessRunId=${encodeURIComponent(harnessRunId)}` });
+  assert.equal(harnessInspect.statusCode, 200);
+  assert.ok(harnessInspect.json().manifest.entries.length > 0);
+  const cleanupDryRun = await restarted.inject({ method: "POST", url: "/ai/store/cleanup", payload: { olderThanDays: 0, dryRun: true } });
+  assert.equal(cleanupDryRun.statusCode, 200);
+  assert.equal(cleanupDryRun.json().cleanup.dryRun, true);
+  await restarted.close();
 });
 
 test("project resolution handles monorepo next apps and exposes resolution report", async () => {
@@ -1936,26 +3276,227 @@ test("cli miniapp run, scenario, closure, and external bridge produce run-scoped
     assert.equal(closurePayload.runId, runPayload.runId);
     assert.equal(closurePayload.driverContract.target, "miniapp");
     assert.ok(["ship", "manual_review_required"].includes(closurePayload.releaseDecision.decision));
-    assert.equal(closureCode, closurePayload.releaseDecision.decision === "hold" ? 1 : 0);
+    assert.equal(closureCode, closurePayload.releaseDecision.decision === "ship" ? 0 : 2);
 
     outputs.length = 0;
     const bridgeCode = await runCli(["miniapp", "run", "--relay", relayUrl, "--driver", "external-agent", "--templateName", "miniapp_home_entry"], {
       stdout: (text) => outputs.push(text),
       stderr: (text) => outputs.push(text),
     });
-    assert.equal(bridgeCode, 0);
+    assert.equal(bridgeCode, 1);
     const bridgePayload = JSON.parse(outputs.join(""));
-    assert.equal(bridgePayload.status, "bridge_required");
-    assert.ok(Array.isArray(bridgePayload.actionPlan));
-    assert.ok(bridgePayload.actionPlan.length > 0);
-    assert.equal(bridgePayload.contract.target, "miniapp");
+    assert.equal(bridgePayload.reasonCode, "driver_required");
+    assert.equal(bridgePayload.driverResolution.required, true);
 
-    const bridgeClosure = await server.inject({ method: "GET", url: `/ai/run/${bridgePayload.runId}/closure` });
-    assert.equal(bridgeClosure.statusCode, 200);
-    assert.equal(bridgeClosure.json().closure.decision.status, "running");
+    outputs.length = 0;
+    const noDriverCode = await runCli(["miniapp", "run", "--relay", relayUrl, "--driver", "devtools-automator", "--templateName", "miniapp_home_entry"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(noDriverCode, 1);
+    const noDriverPayload = JSON.parse(outputs.join(""));
+    assert.ok(["miniapp_cli_not_found", "builtin_miniapp_driver_unavailable", "miniapp_project_path_unresolved"].includes(noDriverPayload.reasonCode));
+    assert.equal(noDriverPayload.driverResolution.required, true);
+    assert.ok(noDriverPayload.forExecutingAI.userActionRequest);
+
+    const manualRun = await server.inject({
+      method: "POST",
+      url: "/runs/start",
+      payload: { label: "manual miniapp", target: "miniapp" },
+    });
+    outputs.length = 0;
+    const manualScenarioCode = await runCli(
+      ["miniapp", "scenario", "--relay", relayUrl, "--runId", manualRun.json().runId, "--templateName", "miniapp_home_entry"],
+      {
+        stdout: (text) => outputs.push(text),
+        stderr: (text) => outputs.push(text),
+      }
+    );
+    assert.equal(manualScenarioCode, 1);
+    assert.equal(JSON.parse(outputs.join("")).reasonCode, "driver_required");
   } finally {
     process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = previousWorkspaceRoot;
     await server.close();
+  }
+});
+
+test("blackbox miniapp requires real driver or Computer Use ledger and records visible evidence", async () => {
+  const workspaceRoot = await createMiniappProjectFixture();
+  const fixtureModule = path.join(process.cwd(), "tests/fixtures/miniapp-driver-module.mjs");
+  const fakeAutomator = path.join(process.cwd(), "tests/fixtures/fake-miniprogram-automator.mjs");
+  const server = createRelayServer({ ...config, port: 0 });
+  const relay = await server.listen({ port: 0, host: "127.0.0.1" });
+  const relayUrl = typeof relay === "string" ? relay.replace(/\/$/, "") : `http://127.0.0.1:${config.port}`;
+  const previousWorkspaceRoot = process.env.DEV_LOG_RELAY_WORKSPACE_ROOT;
+  const previousAutomatorModule = process.env.DEV_LOG_RELAY_MINIAPP_AUTOMATOR_MODULE;
+  const previousFakeVisibleText = process.env.DEV_LOG_RELAY_FAKE_MINIAPP_VISIBLE_TEXT;
+  const outputs: string[] = [];
+  process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = workspaceRoot;
+  try {
+    const noLedgerCode = await runCli(["blackbox", "run", "--relay", relayUrl, "--target", "miniapp", "--driver", "computer-use"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(noLedgerCode, 1);
+    assert.equal(JSON.parse(outputs.join("")).reasonCode, "computer_use_ledger_required");
+
+    outputs.length = 0;
+    const noDriverCode = await runCli(["blackbox", "run", "--relay", relayUrl, "--target", "miniapp", "--driver", "devtools-automator"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(noDriverCode, 1);
+    assert.ok(["miniapp_cli_not_found", "builtin_miniapp_driver_unavailable"].includes(JSON.parse(outputs.join("")).reasonCode));
+
+    outputs.length = 0;
+    const driverCode = await runCli(["blackbox", "run", "--relay", relayUrl, "--target", "miniapp", "--driver", "devtools-automator", "--driverModule", fixtureModule], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(driverCode, 0);
+    const payload = JSON.parse(outputs.join(""));
+    assert.equal(payload.demoProhibited, true);
+    assert.equal(payload.blackboxReport.passed, 1);
+    assert.ok(payload.blackboxReport.visibleEvidence.some((item: string) => item.includes("首页 Ready 列表")));
+
+    outputs.length = 0;
+    process.env.DEV_LOG_RELAY_MINIAPP_AUTOMATOR_MODULE = fakeAutomator;
+    const builtinCode = await runCli(["blackbox", "run", "--relay", relayUrl, "--target", "miniapp", "--driver", "devtools-automator", "--cliPath", process.execPath, "--servicePort", "9420"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(builtinCode, 0);
+    const builtinPayload = JSON.parse(outputs.join(""));
+    assert.equal(builtinPayload.blackboxReport.passed, 1);
+    assert.ok(builtinPayload.blackboxReport.visibleEvidence.some((item: string) => item.includes("首页 Ready 列表")));
+
+    outputs.length = 0;
+    process.env.DEV_LOG_RELAY_FAKE_MINIAPP_VISIBLE_TEXT = "none";
+    const screenshotOnlyCode = await runCli(["blackbox", "run", "--relay", relayUrl, "--target", "miniapp", "--driver", "devtools-automator", "--cliPath", process.execPath, "--servicePort", "9420"], {
+      stdout: (text) => outputs.push(text),
+      stderr: (text) => outputs.push(text),
+    });
+    assert.equal(screenshotOnlyCode, 1);
+    const screenshotOnlyPayload = JSON.parse(outputs.join(""));
+    assert.equal(screenshotOnlyPayload.blackboxReport.failed, 1);
+    assert.equal(screenshotOnlyPayload.blackboxReport.cases[0].failureReason, "visible_evidence_required");
+  } finally {
+    process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = previousWorkspaceRoot;
+    if (previousAutomatorModule === undefined) {
+      delete process.env.DEV_LOG_RELAY_MINIAPP_AUTOMATOR_MODULE;
+    } else {
+      process.env.DEV_LOG_RELAY_MINIAPP_AUTOMATOR_MODULE = previousAutomatorModule;
+    }
+    if (previousFakeVisibleText === undefined) {
+      delete process.env.DEV_LOG_RELAY_FAKE_MINIAPP_VISIBLE_TEXT;
+    } else {
+      process.env.DEV_LOG_RELAY_FAKE_MINIAPP_VISIBLE_TEXT = previousFakeVisibleText;
+    }
+    await server.close();
+  }
+});
+
+test("computer-use miniapp driver module requires and reads a target-project ledger", async () => {
+  const workspaceRoot = await createMiniappProjectFixture();
+  const driverModule = path.join(process.cwd(), "driver-modules/computer-use-miniapp-driver.mjs");
+  const ledgerPath = path.join(await mkdtemp(path.join(os.tmpdir(), "dev-log-relay-computer-use-ledger-")), "ledger.json");
+  await writeFile(
+    ledgerPath,
+    JSON.stringify({
+      targetProjectRoot: workspaceRoot,
+      app: "WeChat DevTools",
+      actions: [
+        {
+          actionId: "computer-use-enter-home",
+          type: "enter_page",
+          pagePath: "/pages/home/index",
+          success: true,
+          reason: "codex_computer_use_observed_home",
+          emittedEvents: [
+            {
+              source: "miniapp",
+              level: "info",
+              message: "navigateTo /pages/home/index",
+              phase: "navigation",
+              route: "/pages/home/index",
+              tags: ["route_transition"],
+              context: { destinationRoute: "/pages/home/index", pageStackRoutes: ["/pages/home/index"] },
+            },
+            {
+              source: "miniapp",
+              level: "info",
+              message: "HomePage.onLoad",
+              phase: "lifecycle",
+              route: "/pages/home/index",
+              tags: ["lifecycle_hook"],
+              context: { hookName: "onLoad" },
+            },
+            {
+              source: "miniapp",
+              level: "info",
+              message: "wx.request GET /home",
+              phase: "network",
+              route: "/pages/home/index",
+              requestId: "computer-use-req-1",
+              network: { url: "/home", method: "GET", statusCode: 200, stage: "success", ok: true },
+            },
+            {
+              source: "miniapp",
+              level: "info",
+              message: "HomePage.setData ready",
+              phase: "lifecycle",
+              route: "/pages/home/index",
+              tags: ["setData", "state_update", "state_signature", "ready"],
+              context: { hookName: "onLoad", keys: ["ready"], stateSignature: "ready", visibleEvidence: ["首页 Ready 列表"], visibleText: "首页 Ready 列表" },
+            },
+          ],
+        },
+      ],
+    }),
+    "utf8"
+  );
+
+  const previousLedger = process.env.DEV_LOG_RELAY_COMPUTER_USE_LEDGER;
+  const scenario = {
+    id: "miniapp_home_entry",
+    target: "miniapp",
+    entry: { page: "/pages/home/index" },
+    actions: [{ id: "computer-use-enter-home", type: "enter_page", pagePath: "/pages/home/index" }],
+  } as any;
+  try {
+    delete process.env.DEV_LOG_RELAY_COMPUTER_USE_LEDGER;
+    const missingLedger = await executeMiniappReferenceDriver({
+      driver: "computer-use",
+      scenario,
+      relay: "http://relay.test",
+      runId: "run-1",
+      projectRoot: workspaceRoot,
+      driverModule,
+    });
+    assert.equal(missingLedger.status, "driver_not_available");
+    assert.equal(missingLedger.reason, "computer_use_ledger_required");
+
+    process.env.DEV_LOG_RELAY_COMPUTER_USE_LEDGER = ledgerPath;
+    const executed = await executeMiniappReferenceDriver({
+      driver: "computer-use",
+      scenario,
+      relay: "http://relay.test",
+      runId: "run-1",
+      projectRoot: workspaceRoot,
+      driverModule,
+    });
+    assert.equal(executed.status, "executed");
+    assert.equal(executed.reason, "driver_module_executed");
+    assert.equal(executed.actionResults.length, 1);
+    assert.equal(executed.actionResults[0].success, true);
+    assert.equal(executed.actionResults[0].completionStatus, "executed");
+    assert.ok(executed.actionResults[0].emittedEvents?.some((event) => event.context?.computerUse === true));
+  } finally {
+    if (previousLedger === undefined) {
+      delete process.env.DEV_LOG_RELAY_COMPUTER_USE_LEDGER;
+    } else {
+      process.env.DEV_LOG_RELAY_COMPUTER_USE_LEDGER = previousLedger;
+    }
   }
 });
 
@@ -2106,7 +3647,7 @@ test("engine loads local scenario catalog and baseline registry, and regression 
   process.env.DEV_LOG_RELAY_WORKSPACE_ROOT = workspaceRoot;
   try {
     const engine = new RelayEngine(config);
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    await new Promise((resolve) => setTimeout(resolve, 100));
 
     const catalog = engine.listProjectScenarioCatalog("miniapp");
     assert.ok(catalog.scenarios.some((entry) => entry.scenario.id === "miniapp_checkout_submit" && entry.source === "project_local"));

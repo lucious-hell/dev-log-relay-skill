@@ -68,18 +68,10 @@ function stringifyArgs(args: unknown[]): string {
     .join(" ");
 }
 
-function wrapHook(config: MiniappEntityConfig, hookName: string, onCall: (...args: unknown[]) => void, onError: (error: unknown) => void) {
+function wrapHook(config: MiniappEntityConfig, hookName: string, onCall: (this: Record<string, any>, ...args: unknown[]) => void, onError: (error: unknown) => void) {
   const original = config[hookName];
   config[hookName] = function wrappedHook(...args: unknown[]) {
-    onCall(...args);
-    const self = this as Record<string, any>;
-    const originalSetData = typeof self?.setData === "function" ? self.setData.bind(self) : null;
-    if (originalSetData) {
-      self.setData = (payload: Record<string, unknown>, callback?: () => void) => {
-        onCall({ __relaySetData: true, keys: Object.keys(payload || {}) });
-        return originalSetData(payload, callback);
-      };
-    }
+    onCall.apply(this as Record<string, any>, args);
     try {
       if (typeof original === "function") {
         return original.apply(this, args);
@@ -88,10 +80,6 @@ function wrapHook(config: MiniappEntityConfig, hookName: string, onCall: (...arg
     } catch (error) {
       onError(error);
       throw error;
-    } finally {
-      if (originalSetData) {
-        self.setData = originalSetData;
-      }
     }
   };
 }
@@ -318,30 +306,40 @@ export function createMiniappRelay(options: MiniappRelayOptions) {
     return ["attached", "ready", "detached"];
   }
 
+  function wrapSetDataOnce(kind: "app" | "page" | "component", name: string, self: Record<string, any>, hookName: string) {
+    if (!self || typeof self.setData !== "function" || self.__devLogRelaySetDataWrapped) {
+      return;
+    }
+    const originalSetData = self.setData.bind(self);
+    Object.defineProperty(self, "__devLogRelaySetDataWrapped", {
+      value: true,
+      configurable: true,
+    });
+    self.setData = (payload: Record<string, unknown>, callback?: () => void) => {
+      const keys = Object.keys(payload || {});
+      send("info", `${name}.setData`, {
+        phase: "lifecycle",
+        component: name,
+        tags: ["setData", "state_update", "state_signature"],
+        context: {
+          kind,
+          hookName,
+          keys,
+          stateSignature: keys.slice().sort().join("|"),
+        },
+      });
+      return originalSetData(payload, callback);
+    };
+  }
+
   function wrapEntity(kind: "app" | "page" | "component", name: string, config: MiniappEntityConfig): MiniappEntityConfig {
     const next = { ...config };
     for (const hookName of lifecycleHooksFor(kind)) {
       wrapHook(
         next,
         hookName,
-        (...args) => {
-          const relaySetData = args.find(
-            (item) => item && typeof item === "object" && "__relaySetData" in (item as Record<string, unknown>)
-          ) as { keys?: string[] } | undefined;
-          if (relaySetData) {
-            send("info", `${name}.setData`, {
-              phase: "lifecycle",
-              component: name,
-              tags: ["setData", "state_update", "state_signature"],
-              context: {
-                kind,
-                hookName,
-                keys: relaySetData.keys || [],
-                stateSignature: (relaySetData.keys || []).slice().sort().join("|"),
-              },
-            });
-            return;
-          }
+        function onEntityHook(this: Record<string, any>, ...args: unknown[]) {
+          wrapSetDataOnce(kind, name, this, hookName);
           send("info", `${name}.${hookName}`, {
             phase: "lifecycle",
             component: name,
@@ -382,6 +380,7 @@ export function createMiniappRelay(options: MiniappRelayOptions) {
           continue;
         }
         next.methods[methodName] = function wrappedComponentMethod(...args: unknown[]) {
+          wrapSetDataOnce("component", componentName, this as Record<string, any>, methodName);
           send("info", `${componentName}.${methodName}`, {
             phase: "lifecycle",
             component: componentName,
